@@ -1,7 +1,6 @@
 require("dotenv").config();
 
-const HOST = "192.168.31.143";
-const PORT = 5500;
+ 
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -66,7 +65,7 @@ app.use("/uploads", express.static("uploads"));
 
 app.post("/api/upload", upload.single("image"), (req, res) => {
   res.json({
-    imageUrl: `http://${HOST}:${PORT}/uploads/${req.file.filename}`
+    imageUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`
   });
 });
 
@@ -77,7 +76,7 @@ app.post("/api/upload", upload.single("image"), (req, res) => {
 app.post("/api/upload-video", upload.single("video"), (req,res)=>{
 
  res.json({
-  videoUrl: `http://${HOST}:${PORT}/uploads/${req.file.filename}`
+  videoUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`
  })
 
 })
