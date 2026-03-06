@@ -1,5 +1,8 @@
 require("dotenv").config();
 
+const HOST = "192.168.31.143";
+const PORT = 5500;
+
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -63,7 +66,7 @@ app.use("/uploads", express.static("uploads"));
 
 app.post("/api/upload", upload.single("image"), (req, res) => {
   res.json({
-    imageUrl: `http://10.0.2.2:5500/uploads/${req.file.filename}`,
+    imageUrl: `http://${HOST}:${PORT}/uploads/${req.file.filename}`
   });
 });
 
@@ -74,7 +77,7 @@ app.post("/api/upload", upload.single("image"), (req, res) => {
 app.post("/api/upload-video", upload.single("video"), (req,res)=>{
 
  res.json({
-  videoUrl:`http://192.168.31.143:5500/uploads/${req.file.filename}`
+  videoUrl: `http://${HOST}:${PORT}/uploads/${req.file.filename}`
  })
 
 })
@@ -396,16 +399,21 @@ app.get("/api/shopify/collections", async (req, res) => {
 
 async function startServer() {
   try {
+
     await mongoose.connect(process.env.MONGO_URI);
+
     console.log("MongoDB Atlas connected ✅");
 
-    app.listen(5500, () => {
-      console.log("Server running on port 5500 🚀");
+    const PORT = process.env.PORT || 5500;
+
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT} 🚀`);
     });
 
   } catch (error) {
-    console.error("Connection failed ❌");
+    console.error("MongoDB connection failed ❌");
     console.error(error);
+    process.exit(1);
   }
 }
 
