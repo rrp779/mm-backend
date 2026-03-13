@@ -335,17 +335,25 @@ app.get("/api/shopify/coupons", async (req, res) => {
 
       codes.forEach((code) => {
 
-        coupons.push({
-          id: code.id,
-          title: rule.title,
-          code: code.code,
-          type: rule.value_type,
-          value: rule.value,
-          minimum: rule.prerequisite_subtotal_range?.greater_than_or_equal_to || null,
-          starts_at: rule.starts_at,
-          ends_at: rule.ends_at,
-        });
+       coupons.push({
+  id: code.id,
+  title: rule.title,
+  code: code.code,
 
+  discount_type: rule.value_type || "buy_x_get_y",
+
+  value: rule.value,
+
+  minimum:
+    rule.prerequisite_subtotal_range?.greater_than_or_equal_to || null,
+
+  starts_at: rule.starts_at,
+  ends_at: rule.ends_at,
+
+  buy_quantity: rule.prerequisite_quantity_range?.greater_than_or_equal_to || null,
+
+  get_quantity: rule.entitled_quantity || null,
+});
       });
 
     }
