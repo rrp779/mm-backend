@@ -301,6 +301,66 @@ app.get("/api/shopify/search", async (req, res) => {
   }
 });
 
+
+/* ------------------ SHOPIFY COUPONS ------------------ */
+
+app.get("/api/shopify/coupons", async (req, res) => {
+  try {
+
+    const priceRulesResponse = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules.json`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+
+    const rules = priceRulesResponse.data.price_rules || [];
+
+    let coupons = [];
+
+    for (const rule of rules) {
+
+      const codesResponse = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules/${rule.id}/discount_codes.json`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+
+      const codes = codesResponse.data.discount_codes || [];
+
+      codes.forEach((code) => {
+
+        coupons.push({
+          id: code.id,
+          title: rule.title,
+          code: code.code,
+          type: rule.value_type,
+          value: rule.value,
+          minimum: rule.prerequisite_subtotal_range?.greater_than_or_equal_to || null,
+          starts_at: rule.starts_at,
+          ends_at: rule.ends_at,
+        });
+
+      });
+
+    }
+
+    res.json(coupons);
+
+  } catch (err) {
+
+    console.error("Coupons Fetch Error:", err.response?.data || err.message);
+
+    res.status(500).json([]);
+
+  }
+});
+
 /* ------------------ SINGLE PRODUCT (ADMIN GRAPHQL) ------------------ */
 
 app.get("/api/products/:id", async (req, res) => {
