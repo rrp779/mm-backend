@@ -554,23 +554,14 @@ app.post("/api/payment/verify", async (req, res) => {
 });
 
 
-await http.post(
-  Uri.parse("$baseUrl/api/payment/verify"),
-  body: jsonEncode({
-    "razorpay_order_id": response.orderId,
-    "razorpay_payment_id": response.paymentId,
-    "razorpay_signature": response.signature,
-    "cart": cartItems
-  }),
-);
-
 
 
 /* ------------------ START SERVER ------------------ */
 
 async function startServer() {
   try {
-
+    
+    
     await mongoose.connect(process.env.MONGO_URI);
 
     console.log("MongoDB Atlas connected ✅");
