@@ -481,7 +481,7 @@ app.post("/api/payment/create-order", async (req, res) => {
     const { amount } = req.body;
 
     const options = {
-      amount: amount * 100,
+      amount: amount,
       currency: "INR",
       receipt: "order_" + Date.now(),
     };
