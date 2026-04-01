@@ -186,6 +186,112 @@ app.delete("/api/sections/:id", async (req, res) => {
   }
 });
 
+
+
+/* ================= SHOPIFY PRODUCT (CACHED) ================= */
+
+app.get("/api/products/:id", async (req, res) => {
+  try {
+    const productId = decodeURIComponent(req.params.id);
+    const cacheKey = `product_${productId}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      console.log("⚡ PRODUCT CACHE HIT");
+      return res.json(cached);
+    }
+
+    console.log("🐢 PRODUCT API HIT");
+
+    const response = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
+      {
+        query: `
+{
+  product(id: "${productId}") {
+    id
+    title
+    descriptionHtml
+    images(first: 10) {
+      edges { node { url } }
+    }
+    variants(first: 50) {
+      edges {
+        node {
+          id
+          title
+          price
+          compareAtPrice
+        }
+      }
+    }
+  }
+}
+`,
+      },
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+      }
+    );
+
+    const product = response.data.data.product;
+
+    cache.set(cacheKey, product, 300);
+
+    res.json(product);
+
+  } catch (err) {
+    console.error("Product error:", err.message);
+    res.status(500).json({});
+  }
+});
+
+/* ================= SHOPIFY COLLECTIONS (CACHED) ================= */
+
+app.get("/api/shopify/collections", async (req, res) => {
+  try {
+    const cacheKey = "collections";
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      console.log("⚡ COLLECTION CACHE HIT");
+      return res.json(cached);
+    }
+
+    console.log("🐢 COLLECTION API HIT");
+
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/collections.json?limit=20`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+        timeout: 10000,
+      }
+    );
+
+    const collections = (response.data.collections || []).map((c) => ({
+      id: c.admin_graphql_api_id,
+      handle: c.handle,
+      title: c.title,
+      image: c.image?.src || "",
+    }));
+
+    cache.set(cacheKey, collections, 300);
+
+    res.json(collections);
+
+  } catch (err) {
+    console.error("Collections error:", err.message);
+    res.status(500).json([]);
+  }
+});
+
+
 /* ================= MONGO EVENTS ================= */
 
 mongoose.connection.on("error", (err) => {
