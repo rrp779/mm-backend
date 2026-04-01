@@ -636,7 +636,7 @@ app.get("/api/products/:id", async (req, res) => {
           title
           availableForSale
           inventoryPolicy
-          quantityAvailable
+          inventoryQuantity
           image {
             url
           }
