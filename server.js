@@ -83,8 +83,6 @@ app.post("/api/upload", upload.single("image"), (req, res) => {
 
 /* ------------------ VIDEO UPLOAD ------------------ */
  
- 
-
 app.post("/api/upload-video", upload.single("video"), (req,res)=>{
 
  res.json({
@@ -93,7 +91,6 @@ app.post("/api/upload-video", upload.single("video"), (req,res)=>{
 
 })
 
- 
 /* ================= SECTION API ================= */
 
 app.get("/api/sections", async (req, res) => {
@@ -639,7 +636,7 @@ app.get("/api/products/:id", async (req, res) => {
           title
           availableForSale
           inventoryPolicy
-          inventoryQuantity
+          quantityAvailable
           image {
             url
           }
