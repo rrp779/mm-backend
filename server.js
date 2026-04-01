@@ -1,5 +1,7 @@
 require("dotenv").config();
 
+ 
+
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -13,36 +15,19 @@ const Razorpay = require("razorpay");
 const crypto = require("crypto");
 
 const NodeCache = require("node-cache");
-const cache = new NodeCache({ stdTTL: 60 }); 
-
-/* ================= GLOBAL ERROR HANDLING ================= */
-
-process.on("uncaughtException", (err) => {
-  console.error("❌ Uncaught Exception:", err);
-});
-
-process.on("unhandledRejection", (err) => {
-  console.error("❌ Unhandled Rejection:", err);
-});
-
-/* ================= BASIC SETUP ================= */
+const cache = new NodeCache({ stdTTL: 60 });  
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
+
 app.use(cors());
 app.use(express.json());
 
-/* ================= HEALTH CHECK ================= */
-
-app.get("/", (req, res) => {
-  res.send("API Running ✅");
-});
-
-/* ================= SCHEMA ================= */
-
+ 
+/* ------------------ SCHEMA ------------------ */
 const SectionSchema = new mongoose.Schema({
   title: String,
   type: String,
@@ -60,26 +45,25 @@ const SectionSchema = new mongoose.Schema({
     paddingBottom: { type: Number, default: 16 },
     borderRadius: { type: Number, default: 0 },
     containerWidth: { type: String, default: "full" },
-    sliderStyle: { type: String, default: "small" },
+     sliderStyle: { type: String, default: "small" }, 
   },
   items: [
     {
       title: String,
       collectionId: String,
-      collectionHandle: String,
+      collectionHandle: String,  
       productId: String,
       image: String,
       visible: { type: Boolean, default: true },
-      video: String,
-      thumbnail: String,
+      video: String,          // uploaded reel video
+      thumbnail: String,      // reel cover image
     },
   ],
 });
 
 const Section = mongoose.model("Section", SectionSchema);
 
-/* ================= IMAGE UPLOAD ================= */
-
+/* ------------------ IMAGE UPLOAD ------------------ */
 const storage = multer.diskStorage({
   destination: "./uploads/",
   filename: (req, file, cb) => {
@@ -92,29 +76,24 @@ const upload = multer({ storage });
 app.use("/uploads", express.static("uploads"));
 
 app.post("/api/upload", upload.single("image"), (req, res) => {
-  try {
-    res.json({
-      imageUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`,
-    });
-  } catch (err) {
-    console.error("Upload error:", err);
-    res.status(500).json({});
-  }
+  res.json({
+    imageUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`
+  });
 });
 
-/* ================= VIDEO UPLOAD ================= */
+/* ------------------ VIDEO UPLOAD ------------------ */
+ 
+ 
 
-app.post("/api/upload-video", upload.single("video"), (req, res) => {
-  try {
-    res.json({
-      videoUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`,
-    });
-  } catch (err) {
-    console.error("Video upload error:", err);
-    res.status(500).json({});
-  }
-});
+app.post("/api/upload-video", upload.single("video"), (req,res)=>{
 
+ res.json({
+  videoUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`
+ })
+
+})
+
+ 
 /* ================= SECTION API ================= */
 
 app.get("/api/sections", async (req, res) => {
@@ -375,16 +354,448 @@ app.get("/api/shopify/search", async (req, res) => {
 });
 
 
-/* ================= MONGO EVENTS ================= */
+/* ------------------ TRENDING SCHEMA ------------------ */
 
-mongoose.connection.on("error", (err) => {
-  console.error("MongoDB error:", err);
+const TrendingSchema = new mongoose.Schema({
+  productId: String,
+  views: { type: Number, default: 1 },
+  date: { type: Date, default: Date.now },
 });
 
-/* ================= START SERVER ================= */
+const Trending = mongoose.model("Trending", TrendingSchema);
+
+
+/* ------------------ TRACK PRODUCT VIEW ------------------ */
+
+app.post("/api/trending/view", async (req, res) => {
+  try {
+
+    const { productId } = req.body;
+
+    if (!productId) {
+      return res.json({ success: false });
+    }
+
+    const today = new Date();
+    today.setHours(0,0,0,0);
+
+    let record = await Trending.findOne({
+      productId,
+      date: { $gte: today }
+    });
+
+    if (record) {
+      record.views += 1;
+      await record.save();
+    } else {
+      await Trending.create({
+        productId,
+        views: 1
+      });
+    }
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("Trending view error:", err);
+    res.json({ success: false });
+  }
+});
+
+
+
+/* ------------------ TRENDING PRODUCTS ------------------ */
+
+app.get("/api/trending", async (req, res) => {
+  try {
+
+    const last7days = new Date();
+    last7days.setDate(last7days.getDate() - 7);
+
+    const trending = await Trending.aggregate([
+      { $match: { date: { $gte: last7days } } },
+      {
+        $group: {
+          _id: "$productId",
+          views: { $sum: "$views" }
+        }
+      },
+      { $sort: { views: -1 } },
+      { $limit: 20 }
+    ]);
+
+    res.json(trending);
+
+  } catch (err) {
+    console.error("Trending fetch error:", err);
+    res.json([]);
+  }
+});
+
+
+/* ------------------ BEST SELLING ------------------ */
+
+app.get("/api/shopify/best-selling", async (req, res) => {
+  try {
+
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/products.json?limit=50&order=best-selling`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+
+    const products = (response.data.products || []).map((p) => ({
+      id: p.admin_graphql_api_id,
+      title: p.title,
+      vendor: p.vendor,
+      productType: p.product_type,
+      image: p.image?.src || "",
+      price: p.variants?.[0]?.price || "0",
+      totalInventory: p.variants?.[0]?.inventory_quantity || 0,
+    }));
+
+    res.json(products);
+
+  } catch (err) {
+    console.error("Best Selling Error:", err.response?.data || err.message);
+    res.json([]);
+  }
+});
+
+/* ------------------ SHOPIFY SEARCH ------------------ */
+
+app.get("/api/shopify/search", async (req, res) => {
+  const { type = "product", q = "" } = req.query;
+
+  if (!q) return res.json([]);
+
+  try {
+
+    const query = `
+    {
+      products(first: 20, query: "title:*${q}* OR vendor:*${q}*") {
+        edges {
+          node {
+            id
+            title
+            vendor
+            featuredImage {
+              url
+            }
+          }
+        }
+      }
+
+      collections(first: 20, query: "title:*${q}*") {
+        edges {
+          node {
+            id
+            title
+            image {
+              url
+            }
+          }
+        }
+      }
+    }
+    `;
+
+    const response = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
+      { query },
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const data = response.data.data;
+
+    if (type === "product") {
+      const products = data.products.edges.map((e) => ({
+        id: e.node.id,
+        title: e.node.title,
+        image: e.node.featuredImage?.url || "",
+      }));
+
+      return res.json(products);
+    }
+
+    if (type === "collection") {
+      const collections = data.collections.edges.map((e) => ({
+        id: e.node.id,
+        title: e.node.title,
+        image: e.node.image?.url || "",
+      }));
+
+      return res.json(collections);
+    }
+
+    res.json([]);
+
+  } catch (err) {
+    console.error("GraphQL Search Error:", err.response?.data || err.message);
+    res.status(500).json([]);
+  }
+});
+
+
+/* ------------------ SHOPIFY COUPONS ------------------ */
+
+app.get("/api/shopify/coupons", async (req, res) => {
+  try {
+
+    const priceRulesResponse = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules.json`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+
+    const rules = priceRulesResponse.data.price_rules || [];
+
+    let coupons = [];
+
+    for (const rule of rules) {
+
+      const codesResponse = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules/${rule.id}/discount_codes.json`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+
+      const codes = codesResponse.data.discount_codes || [];
+
+      codes.forEach((code) => {
+
+       coupons.push({
+  id: code.id,
+  title: rule.title,
+  code: code.code,
+
+  discount_type: rule.value_type || "buy_x_get_y",
+
+  value: rule.value,
+
+  minimum:
+    rule.prerequisite_subtotal_range?.greater_than_or_equal_to || null,
+
+  starts_at: rule.starts_at,
+  ends_at: rule.ends_at,
+
+  buy_quantity: rule.prerequisite_quantity_range?.greater_than_or_equal_to || null,
+
+  get_quantity: rule.entitled_quantity || null,
+});
+      });
+
+    }
+
+    res.json(coupons);
+
+  } catch (err) {
+
+    console.error("Coupons Fetch Error:", err.response?.data || err.message);
+
+    res.status(500).json([]);
+
+  }
+});
+
+/* ------------------ SINGLE PRODUCT (ADMIN GRAPHQL) ------------------ */
+
+app.get("/api/products/:id", async (req, res) => {
+  try {
+    const productId = decodeURIComponent(req.params.id);
+
+    const response = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
+      {
+        query: `
+{
+  product(id: "${productId}") {
+    id
+    title
+    descriptionHtml
+    images(first: 10) {
+      edges {
+        node { url }
+      }
+    }
+    variants(first: 50) {
+      edges {
+        node {
+          id
+          title
+          availableForSale
+          inventoryPolicy
+          inventoryQuantity
+          image {
+            url
+          }
+          price
+          compareAtPrice
+          selectedOptions {
+            name
+            value
+          }
+        }
+      }
+    }
+  }
+}
+`,
+      },
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    // 🔥 Handle GraphQL errors safely
+    if (!response.data.data || !response.data.data.product) {
+      console.error("GraphQL Error:", response.data);
+      return res.status(500).json({});
+    }
+
+    res.json(response.data.data.product);
+
+  } catch (err) {
+    console.error("Product Fetch Error:", err.response?.data || err.message);
+    res.status(500).json({});
+  }
+});
+
+
+app.get("/api/shopify/collections", async (req, res) => {
+  try {
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/collections.json?limit=20`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+
+    const collections = (response.data.collections || []).map((c) => ({
+      id: c.admin_graphql_api_id,
+       handle: c.handle,  
+      title: c.title,
+      image: c.image?.src || "",
+    }));
+
+    res.json(collections);
+
+  } catch (err) {
+    console.error("Collections Error:", err.response?.data || err.message);
+    res.status(500).json([]);
+  }
+});
+
+
+/* ------------------ CREATE PAYMENT ORDER ------------------ */
+
+app.post("/api/payment/create-order", async (req, res) => {
+
+  try {
+
+    const { amount } = req.body;
+
+    const options = {
+      amount: amount,
+      currency: "INR",
+      receipt: "order_" + Date.now(),
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    res.json(order);
+
+  } catch (error) {
+    console.error("Razorpay order error:", error);
+    res.status(500).json({ error: "Payment order failed" });
+  }
+
+});
+
+/* ------------------ VERIFY PAYMENT ------------------ */
+
+app.post("/api/payment/verify", async (req, res) => {
+
+  try {
+
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      cart
+    } = req.body;
+
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.json({ success: false });
+    }
+
+    /* ------------------ CREATE SHOPIFY ORDER ------------------ */
+
+    const shopifyOrder = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
+      {
+        order: {
+          line_items: cart,
+          financial_status: "paid",
+        },
+      },
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+
+    res.json({
+      success: true,
+      order: shopifyOrder.data.order
+    });
+
+  } catch (err) {
+
+    console.error("Payment verify error:", err.response?.data || err.message);
+
+    res.json({ success: false });
+
+  }
+
+});
+
+
+
+
+/* ------------------ START SERVER ------------------ */
 
 async function startServer() {
   try {
+    
+    
     await mongoose.connect(process.env.MONGO_URI);
 
     console.log("MongoDB Atlas connected ✅");
@@ -396,7 +807,8 @@ async function startServer() {
     });
 
   } catch (error) {
-    console.error("MongoDB connection failed ❌", error);
+    console.error("MongoDB connection failed ❌");
+    console.error(error);
     process.exit(1);
   }
 }
