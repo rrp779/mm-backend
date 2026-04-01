@@ -12,6 +12,9 @@ const app = express();
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
 
+const NodeCache = require("node-cache");
+const cache = new NodeCache({ stdTTL: 60 }); 
+
 /* ================= GLOBAL ERROR HANDLING ================= */
 
 process.on("uncaughtException", (err) => {
@@ -116,8 +119,23 @@ app.post("/api/upload-video", upload.single("video"), (req, res) => {
 
 app.get("/api/sections", async (req, res) => {
   try {
+    // 🔥 1. check cache
+    const cached = cache.get("sections");
+
+    if (cached) {
+      console.log("⚡ CACHE HIT");
+      return res.json(cached);
+    }
+
+    // 🔥 2. DB call
+    console.log("🐢 DB HIT");
     const sections = await Section.find().sort({ order: 1 });
+
+    // 🔥 3. save in cache
+    cache.set("sections", sections);
+
     res.json(sections);
+
   } catch (err) {
     console.error("Sections fetch error:", err);
     res.status(500).json([]);
@@ -128,6 +146,9 @@ app.post("/api/sections", async (req, res) => {
   try {
     const section = new Section(req.body);
     await section.save();
+
+    cache.del("sections"); // 🔥 clear cache
+
     res.json(section);
   } catch (err) {
     console.error("Create section error:", err);
@@ -142,6 +163,9 @@ app.put("/api/sections/:id", async (req, res) => {
       req.body,
       { new: true }
     );
+
+    cache.del("sections"); // 🔥 clear cache
+
     res.json(updated);
   } catch (err) {
     console.error("Update section error:", err);
@@ -152,6 +176,9 @@ app.put("/api/sections/:id", async (req, res) => {
 app.delete("/api/sections/:id", async (req, res) => {
   try {
     await Section.findByIdAndDelete(req.params.id);
+
+    cache.del("sections"); // 🔥 clear cache
+
     res.json({ success: true });
   } catch (err) {
     console.error("Delete section error:", err);
