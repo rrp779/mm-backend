@@ -129,7 +129,7 @@ app.get("/api/sections", async (req, res) => {
 
     // 🔥 2. DB call
     console.log("🐢 DB HIT");
-    const sections = await Section.find().sort({ order: 1 });
+    const sections = await Section.find().sort({ order: 1 }).lean(); 
 
     // 🔥 3. save in cache
     cache.set("sections", sections);
