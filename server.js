@@ -291,6 +291,89 @@ app.get("/api/shopify/collections", async (req, res) => {
   }
 });
 
+/* ================= SHOPIFY SEARCH (CACHED) ================= */
+
+app.get("/api/shopify/search", async (req, res) => {
+  const { type = "product", q = "" } = req.query;
+
+  if (!q) return res.json([]);
+
+  try {
+    const cacheKey = `search_${type}_${q}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      console.log("⚡ SEARCH CACHE HIT");
+      return res.json(cached);
+    }
+
+    console.log("🐢 SEARCH API HIT");
+
+    const query = `
+    {
+      products(first: 20, query: "title:*${q}* OR vendor:*${q}*") {
+        edges {
+          node {
+            id
+            title
+            featuredImage { url }
+          }
+        }
+      }
+      collections(first: 20, query: "title:*${q}*") {
+        edges {
+          node {
+            id
+            title
+            image { url }
+          }
+        }
+      }
+    }
+    `;
+
+    const response = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
+      { query },
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+      }
+    );
+
+    const data = response.data.data;
+
+    let result = [];
+
+    if (type === "product") {
+      result = data.products.edges.map((e) => ({
+        id: e.node.id,
+        title: e.node.title,
+        image: e.node.featuredImage?.url || "",
+      }));
+    }
+
+    if (type === "collection") {
+      result = data.collections.edges.map((e) => ({
+        id: e.node.id,
+        title: e.node.title,
+        image: e.node.image?.url || "",
+      }));
+    }
+
+    cache.set(cacheKey, result, 120);
+
+    res.json(result);
+
+  } catch (err) {
+    console.error("Search error:", err.message);
+    res.status(500).json([]);
+  }
+});
+
 
 /* ================= MONGO EVENTS ================= */
 
