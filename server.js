@@ -706,15 +706,22 @@ app.get("/api/shopify/collections", async (req, res) => {
 /* ------------------ CREATE PAYMENT ORDER ------------------ */
 
 app.post("/api/payment/create-order", async (req, res) => {
-
   try {
+    const { amount, cart, email, phone } = req.body;
 
-    const { amount } = req.body;
+    const receiptId = "order_" + Date.now();
 
     const options = {
-      amount: amount,
+      amount,
       currency: "INR",
-      receipt: "order_" + Date.now(),
+      receipt: receiptId,
+
+      notes: {
+        email,
+        phone,
+        cart: JSON.stringify(cart),
+        receipt: receiptId,
+      },
     };
 
     const order = await razorpay.orders.create(options);
@@ -725,31 +732,64 @@ app.post("/api/payment/create-order", async (req, res) => {
     console.error("Razorpay order error:", error);
     res.status(500).json({ error: "Payment order failed" });
   }
-
 });
 
 /* ------------------ VERIFY PAYMENT ------------------ */
 
 app.post("/api/payment/verify", async (req, res) => {
-
   try {
-
     const {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
-      cart
+
+      first_name,
+      last_name,
+      email,
+      phone,
+      address1,
+      city,
+      state,
+      pincode,
+      amount
     } = req.body;
+
+    /* ------------------ VERIFY SIGNATURE ------------------ */
 
     const body = razorpay_order_id + "|" + razorpay_payment_id;
 
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(body.toString())
+      .update(body)
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
-      return res.json({ success: false });
+      return res.json({ success: false, message: "Invalid signature" });
+    }
+
+    /* ------------------ FETCH RAZORPAY ORDER (SECURITY FIX) ------------------ */
+
+    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
+
+    const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+
+    /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
+
+    const existingOrder = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=1&fields=id,note`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+
+    const alreadyExists = existingOrder.data.orders.some(o =>
+      o.note?.includes(razorpay_payment_id)
+    );
+
+    if (alreadyExists) {
+      return res.json({ success: true, message: "Order already created" });
     }
 
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
@@ -759,7 +799,65 @@ app.post("/api/payment/verify", async (req, res) => {
       {
         order: {
           line_items: cart,
+
           financial_status: "paid",
+
+          customer: {
+            first_name,
+            last_name,
+            email,
+            phone,
+          },
+
+          email,
+
+          billing_address: {
+            first_name,
+            last_name,
+            address1,
+            city,
+            province: state,
+            country: "India",
+            zip: pincode,
+            phone,
+          },
+
+          shipping_address: {
+            first_name,
+            last_name,
+            address1,
+            city,
+            province: state,
+            country: "India",
+            zip: pincode,
+            phone,
+          },
+
+          shipping_lines: [
+            {
+              title: "Free Shipping",
+              price: "0.00",
+              code: "FREE",
+            },
+          ],
+
+          transactions: [
+            {
+              kind: "sale",
+              status: "success",
+              amount: (amount / 100).toString(),
+              gateway: "Razorpay",
+            },
+          ],
+
+          tags: "razorpay,upi",
+
+          gateway: "Razorpay",
+
+          /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
+          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
+
+          processing_method: "direct",
         },
       },
       {
@@ -771,21 +869,17 @@ app.post("/api/payment/verify", async (req, res) => {
 
     res.json({
       success: true,
-      order: shopifyOrder.data.order
+      order: shopifyOrder.data.order,
     });
 
   } catch (err) {
-
     console.error("Payment verify error:", err.response?.data || err.message);
 
     res.json({ success: false });
-
   }
-
 });
 
-
-
+ 
 
 /* ------------------ START SERVER ------------------ */
 
