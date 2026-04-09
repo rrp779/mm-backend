@@ -754,6 +754,24 @@ app.post("/api/payment/verify", async (req, res) => {
       amount
     } = req.body;
 
+    /* ------------------ BASIC VALIDATION ------------------ */
+
+    if (
+      !razorpay_order_id ||
+      !razorpay_payment_id ||
+      !razorpay_signature ||
+      !email ||
+      !first_name ||
+      !address1 ||
+      !city ||
+      !pincode
+    ) {
+      return res.json({
+        success: false,
+        message: "Missing required fields",
+      });
+    }
+
     /* ------------------ VERIFY SIGNATURE ------------------ */
 
     const body = razorpay_order_id + "|" + razorpay_payment_id;
@@ -764,32 +782,41 @@ app.post("/api/payment/verify", async (req, res) => {
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
-      return res.json({ success: false, message: "Invalid signature" });
+      return res.json({
+        success: false,
+        message: "Invalid signature",
+      });
     }
 
-    /* ------------------ FETCH RAZORPAY ORDER (SECURITY FIX) ------------------ */
+    /* ------------------ FETCH ORDER FROM RAZORPAY ------------------ */
 
-    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
+    const razorpayOrder = await razorpay.orders.fetch(
+      razorpay_order_id
+    );
 
     const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
 
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
-    const existingOrder = await axios.get(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=1&fields=id,note`,
+    const existingOrders = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
       {
         headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "X-Shopify-Access-Token":
+            process.env.SHOPIFY_ADMIN_TOKEN,
         },
       }
     );
 
-    const alreadyExists = existingOrder.data.orders.some(o =>
+    const alreadyExists = existingOrders.data.orders.some((o) =>
       o.note?.includes(razorpay_payment_id)
     );
 
     if (alreadyExists) {
-      return res.json({ success: true, message: "Order already created" });
+      return res.json({
+        success: true,
+        message: "Order already created",
+      });
     }
 
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
@@ -802,12 +829,7 @@ app.post("/api/payment/verify", async (req, res) => {
 
           financial_status: "paid",
 
-          customer: {
-            first_name,
-            last_name,
-            email,
-            phone,
-          },
+          
 
           email,
 
@@ -851,10 +873,8 @@ app.post("/api/payment/verify", async (req, res) => {
           ],
 
           tags: "razorpay,upi",
-
           gateway: "Razorpay",
 
-          /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
           note: `Razorpay Payment ID: ${razorpay_payment_id}`,
 
           processing_method: "direct",
@@ -862,23 +882,29 @@ app.post("/api/payment/verify", async (req, res) => {
       },
       {
         headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "X-Shopify-Access-Token":
+            process.env.SHOPIFY_ADMIN_TOKEN,
         },
       }
     );
 
-    res.json({
+    return res.json({
       success: true,
       order: shopifyOrder.data.order,
     });
 
   } catch (err) {
-    console.error("Payment verify error:", err.response?.data || err.message);
+    console.error(
+      "Payment verify error:",
+      err.response?.data || err.message
+    );
 
-    res.json({ success: false });
+    return res.json({
+      success: false,
+      error: err.response?.data || err.message,
+    });
   }
 });
-
  
 
 /* ------------------ START SERVER ------------------ */
