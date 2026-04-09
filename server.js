@@ -794,7 +794,13 @@ app.post("/api/payment/verify", async (req, res) => {
       razorpay_order_id
     );
 
-    const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+    let cart = [];
+
+try {
+  cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+} catch (e) {
+  console.error("Cart parse error", e);
+} 
 
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
