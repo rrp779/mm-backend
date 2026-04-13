@@ -792,13 +792,38 @@ app.post("/api/payment/verify", async (req, res) => {
       return res.json({ success: true, message: "Order already created" });
     }
 
+    /* ------------------ FIXED LINE ITEMS ------------------ */
+
+    const lineItems = cart.map(item => ({
+      variant_id: item.variant_id,
+      quantity: item.quantity || 1,
+
+      /// ✅ PRODUCT TITLE
+      title: item.title || "",
+
+      /// ✅ VARIANT NAME
+      variant_title: item.variant_title || "",
+
+      /// ✅ PRICE (STRING REQUIRED)
+      price: String(item.price || "1.00"),
+
+      /// ✅ STORE IMAGE
+      properties: [
+        {
+          name: "image",
+          value: item.image || ""
+        }
+      ]
+    }));
+
+
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
 
     const shopifyOrder = await axios.post(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
-          line_items: cart,
+          line_items: lineItems,
 
           financial_status: "paid",
 
