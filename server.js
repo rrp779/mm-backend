@@ -834,10 +834,9 @@ const lineItems = cart.map(item => ({
   variant_id: item.variant_id,
   quantity: item.quantity,
 
-  /// ✅ FIX PRICE (REQUIRED FOR TOTALS)
-  price: item.price,
+  /// ✅ SAFE PRICE FIX
+  price: item.price ? item.price.toString() : "0.00",
 
-  /// ✅ STORE EXTRA DATA
   properties: [
     { name: "image", value: item.image || "" },
     { name: "mrp", value: item.compare_at_price || "" }
