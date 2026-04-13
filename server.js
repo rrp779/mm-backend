@@ -830,82 +830,194 @@ try {
     }
 
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
-const lineItems = cart.map(item => ({
-  variant_id: item.variant_id,
-  quantity: item.quantity,
+app.post("/api/payment/verify", async (req, res) => {
+  try {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
 
-  /// ✅ SAFE PRICE FIX
-  price: item.price ? item.price.toString() : "0.00",
-
-  properties: [
-    { name: "image", value: item.image || "" },
-    { name: "mrp", value: item.compare_at_price || "" }
-  ]
-})); 
-   const shopifyOrder = await axios.post(
-  `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
-  {
-    order: {
-      line_items: lineItems,
-
-      financial_status: "paid",
-        inventory_behaviour: "decrement_obeying_policy",
-
+      first_name,
+      last_name,
       email,
+      phone,
+      address1,
+      city,
+      state,
+      pincode,
+      amount,
+      total_mrp,
+      discount,
+      coupon_discount,
+      shipping
+    } = req.body;
 
-      billing_address: {
-        first_name,
-        last_name,
-        address1,
-        city,
-        province: state,
-        country: "India",
-        zip: pincode,
-        phone,
-      },
+    /* ------------------ VALIDATION ------------------ */
 
-      shipping_address: {
-        first_name,
-        last_name,
-        address1,
-        city,
-        province: state,
-        country: "India",
-        zip: pincode,
-        phone,
-      },
+    if (
+      !razorpay_order_id ||
+      !razorpay_payment_id ||
+      !razorpay_signature ||
+      !email ||
+      !first_name ||
+      !address1 ||
+      !city ||
+      !pincode
+    ) {
+      return res.json({
+        success: false,
+        message: "Missing required fields",
+      });
+    }
 
-      /// ✅ SHIPPING FIX
-      shipping_lines: [
-        {
-          title: "Shipping",
-          price: (shipping || 0).toString(),
+    /* ------------------ VERIFY SIGNATURE ------------------ */
+
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.json({
+        success: false,
+        message: "Invalid signature",
+      });
+    }
+
+    /* ------------------ FETCH RAZORPAY ORDER ------------------ */
+
+    const razorpayOrder = await razorpay.orders.fetch(
+      razorpay_order_id
+    );
+
+    let cart = [];
+
+    try {
+      cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+    } catch (e) {
+      console.error("Cart parse error", e);
+    }
+
+    if (!cart.length) {
+      return res.json({
+        success: false,
+        message: "Cart missing in Razorpay",
+      });
+    }
+
+    /* ------------------ DUPLICATE CHECK ------------------ */
+
+    const existingOrders = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
+      {
+        headers: {
+          "X-Shopify-Access-Token":
+            process.env.SHOPIFY_ADMIN_TOKEN,
         },
-      ],
+      }
+    );
 
-      /// ✅ COUPON FIX
-      discount_codes: coupon_discount > 0 ? [
-        {
-          code: "COUPON",
-          amount: coupon_discount.toString(),
-          type: "fixed_amount"
-        }
-      ] : [],
+    const alreadyExists = existingOrders.data.orders.some((o) =>
+      o.note?.includes(razorpay_payment_id)
+    );
 
-      transactions: [
-        {
-          kind: "sale",
-          status: "success",
-          amount: (amount / 100).toString(),
+    if (alreadyExists) {
+      return res.json({
+        success: true,
+        message: "Order already created",
+      });
+    }
+
+    /* ------------------ SAFE LINE ITEMS ------------------ */
+
+    const lineItems = cart.map(item => {
+      if (!item.variant_id) {
+        throw new Error("Invalid variant_id in cart");
+      }
+
+      return {
+        variant_id: item.variant_id,
+        quantity: item.quantity || 1,
+
+        /// ✅ SAFE PRICE (CRITICAL FIX)
+        price: String(item.price || "1.00"),
+
+        properties: [
+          { name: "image", value: item.image || "" },
+          { name: "mrp", value: item.compare_at_price || "" }
+        ]
+      };
+    });
+
+    /* ------------------ CREATE SHOPIFY ORDER ------------------ */
+
+    const shopifyOrder = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
+      {
+        order: {
+          line_items: lineItems,
+
+          financial_status: "paid",
+          fulfillment_status: "unfulfilled",
+          inventory_behaviour: "decrement_obeying_policy",
+
+          email,
+
+          billing_address: {
+            first_name,
+            last_name,
+            address1,
+            city,
+            province: state,
+            country: "India",
+            zip: pincode,
+            phone,
+          },
+
+          shipping_address: {
+            first_name,
+            last_name,
+            address1,
+            city,
+            province: state,
+            country: "India",
+            zip: pincode,
+            phone,
+          },
+
+          /// ✅ SHIPPING
+          shipping_lines: [
+            {
+              title: "Shipping",
+              price: String(shipping || 0),
+            },
+          ],
+
+          /// ✅ COUPON
+          discount_codes: coupon_discount > 0 ? [
+            {
+              code: "COUPON",
+              amount: String(coupon_discount),
+              type: "fixed_amount"
+            }
+          ] : [],
+
+          transactions: [
+            {
+              kind: "sale",
+              status: "success",
+              amount: (amount / 100).toString(),
+              gateway: "Razorpay",
+            },
+          ],
+
+          tags: "razorpay,upi",
           gateway: "Razorpay",
-        },
-      ],
 
-      tags: "razorpay,upi",
-      gateway: "Razorpay",
-
-      /// ✅ SAVE FULL BREAKDOWN
-      note: `
+          /// ✅ SAVE BREAKDOWN
+          note: `
 Razorpay Payment ID: ${razorpay_payment_id}
 MRP: ${total_mrp}
 Discount: ${discount}
@@ -913,16 +1025,16 @@ Coupon: ${coupon_discount}
 Shipping: ${shipping}
 `,
 
-      processing_method: "direct",
-    },
-  },
-  {
-    headers: {
-      "X-Shopify-Access-Token":
-        process.env.SHOPIFY_ADMIN_TOKEN,
-    },
-  }
-); 
+          processing_method: "direct",
+        },
+      },
+      {
+        headers: {
+          "X-Shopify-Access-Token":
+            process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
 
     return res.json({
       success: true,
@@ -931,17 +1043,16 @@ Shipping: ${shipping}
 
   } catch (err) {
     console.error(
-      "Payment verify error:",
+      "🔥 VERIFY ERROR:",
       err.response?.data || err.message
     );
 
-    return res.json({
+    return res.status(500).json({
       success: false,
-      error: err.response?.data || err.message,
+      message: err.response?.data || err.message,
     });
   }
 });
- 
 
 /* ------------------ START SERVER ------------------ */
 
