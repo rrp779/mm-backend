@@ -734,8 +734,8 @@ app.post("/api/payment/create-order", async (req, res) => {
   }
 });
 
- 
-    /* ------------------ CREATE SHOPIFY ORDER ------------------ */
+/* ------------------ VERIFY PAYMENT ------------------ */
+
 app.post("/api/payment/verify", async (req, res) => {
   try {
     const {
@@ -751,14 +751,10 @@ app.post("/api/payment/verify", async (req, res) => {
       city,
       state,
       pincode,
-      amount,
-      total_mrp,
-      discount,
-      coupon_discount,
-      shipping
+      amount
     } = req.body;
 
-    /* ------------------ VALIDATION ------------------ */
+    /* ------------------ BASIC VALIDATION ------------------ */
 
     if (
       !razorpay_order_id ||
@@ -792,7 +788,7 @@ app.post("/api/payment/verify", async (req, res) => {
       });
     }
 
-    /* ------------------ FETCH RAZORPAY ORDER ------------------ */
+    /* ------------------ FETCH ORDER FROM RAZORPAY ------------------ */
 
     const razorpayOrder = await razorpay.orders.fetch(
       razorpay_order_id
@@ -800,20 +796,13 @@ app.post("/api/payment/verify", async (req, res) => {
 
     let cart = [];
 
-    try {
-      cart = JSON.parse(razorpayOrder.notes.cart || "[]");
-    } catch (e) {
-      console.error("Cart parse error", e);
-    }
+try {
+  cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+} catch (e) {
+  console.error("Cart parse error", e);
+}
 
-    if (!cart.length) {
-      return res.json({
-        success: false,
-        message: "Cart missing in Razorpay",
-      });
-    }
-
-    /* ------------------ DUPLICATE CHECK ------------------ */
+    /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
     const existingOrders = await axios.get(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
@@ -836,38 +825,17 @@ app.post("/api/payment/verify", async (req, res) => {
       });
     }
 
-    /* ------------------ SAFE LINE ITEMS ------------------ */
-
-    const lineItems = cart.map(item => {
-      if (!item.variant_id) {
-        throw new Error("Invalid variant_id in cart");
-      }
-
-      return {
-        variant_id: item.variant_id,
-        quantity: item.quantity || 1,
-
-        /// ✅ SAFE PRICE (CRITICAL FIX)
-        price: String(item.price || "1.00"),
-
-        properties: [
-          { name: "image", value: item.image || "" },
-          { name: "mrp", value: item.compare_at_price || "" }
-        ]
-      };
-    });
-
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
 
     const shopifyOrder = await axios.post(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
-          line_items: lineItems,
+          line_items: cart,
 
           financial_status: "paid",
-          fulfillment_status: "unfulfilled",
-          inventory_behaviour: "decrement_obeying_policy",
+
+          
 
           email,
 
@@ -893,22 +861,13 @@ app.post("/api/payment/verify", async (req, res) => {
             phone,
           },
 
-          /// ✅ SHIPPING
           shipping_lines: [
             {
-              title: "Shipping",
-              price: String(shipping || 0),
+              title: "Free Shipping",
+              price: "0.00",
+              code: "FREE",
             },
           ],
-
-          /// ✅ COUPON
-          discount_codes: coupon_discount > 0 ? [
-            {
-              code: "COUPON",
-              amount: String(coupon_discount),
-              type: "fixed_amount"
-            }
-          ] : [],
 
           transactions: [
             {
@@ -922,14 +881,7 @@ app.post("/api/payment/verify", async (req, res) => {
           tags: "razorpay,upi",
           gateway: "Razorpay",
 
-          /// ✅ SAVE BREAKDOWN
-          note: `
-Razorpay Payment ID: ${razorpay_payment_id}
-MRP: ${total_mrp}
-Discount: ${discount}
-Coupon: ${coupon_discount}
-Shipping: ${shipping}
-`,
+          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
 
           processing_method: "direct",
         },
@@ -947,18 +899,20 @@ Shipping: ${shipping}
       order: shopifyOrder.data.order,
     });
 
-   } catch (err) {
+  } catch (err) {
     console.error(
-      "🔥 VERIFY ERROR:",
+      "Payment verify error:",
       err.response?.data || err.message
     );
 
-    return res.status(500).json({
+    return res.json({
       success: false,
-      message: err.response?.data || err.message,
+      error: err.response?.data || err.message,
     });
   }
 });
+ 
+
 /* ------------------ START SERVER ------------------ */
 
 async function startServer() {
