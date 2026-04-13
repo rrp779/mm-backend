@@ -1041,7 +1041,7 @@ Shipping: ${shipping}
       order: shopifyOrder.data.order,
     });
 
-  } catch (err) {
+   } catch (err) {
     console.error(
       "🔥 VERIFY ERROR:",
       err.response?.data || err.message
@@ -1053,7 +1053,6 @@ Shipping: ${shipping}
     });
   }
 });
-
 /* ------------------ START SERVER ------------------ */
 
 async function startServer() {
