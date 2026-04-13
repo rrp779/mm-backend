@@ -733,7 +733,7 @@ app.post("/api/payment/create-order", async (req, res) => {
     res.status(500).json({ error: "Payment order failed" });
   }
 });
- 
+
 /* ------------------ VERIFY PAYMENT ------------------ */
 
 app.post("/api/payment/verify", async (req, res) => {
@@ -751,30 +751,8 @@ app.post("/api/payment/verify", async (req, res) => {
       city,
       state,
       pincode,
-      amount,
-      total_mrp,
-      discount,
-      coupon_discount,
-      shipping
+      amount
     } = req.body;
-
-    /* ------------------ VALIDATION ------------------ */
-
-    if (
-      !razorpay_order_id ||
-      !razorpay_payment_id ||
-      !razorpay_signature ||
-      !email ||
-      !first_name ||
-      !address1 ||
-      !city ||
-      !pincode
-    ) {
-      return res.json({
-        success: false,
-        message: "Missing required fields",
-      });
-    }
 
     /* ------------------ VERIFY SIGNATURE ------------------ */
 
@@ -786,76 +764,33 @@ app.post("/api/payment/verify", async (req, res) => {
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
-      return res.json({
-        success: false,
-        message: "Invalid signature",
-      });
+      return res.json({ success: false, message: "Invalid signature" });
     }
 
-    /* ------------------ FETCH RAZORPAY ORDER ------------------ */
+    /* ------------------ FETCH RAZORPAY ORDER (SECURITY FIX) ------------------ */
 
-    const razorpayOrder = await razorpay.orders.fetch(
-      razorpay_order_id
-    );
+    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
 
-    let cart = [];
+    const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
 
-    try {
-      cart = JSON.parse(razorpayOrder.notes.cart || "[]");
-    } catch (e) {
-      console.error("Cart parse error", e);
-    }
+    /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
-    if (!cart.length) {
-      return res.json({
-        success: false,
-        message: "Cart missing in Razorpay",
-      });
-    }
-
-    /* ------------------ DUPLICATE CHECK ------------------ */
-
-    const existingOrders = await axios.get(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
+    const existingOrder = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=1&fields=id,note`,
       {
         headers: {
-          "X-Shopify-Access-Token":
-            process.env.SHOPIFY_ADMIN_TOKEN,
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
         },
       }
     );
 
-    const alreadyExists = existingOrders.data.orders.some((o) =>
+    const alreadyExists = existingOrder.data.orders.some(o =>
       o.note?.includes(razorpay_payment_id)
     );
 
     if (alreadyExists) {
-      return res.json({
-        success: true,
-        message: "Order already created",
-      });
+      return res.json({ success: true, message: "Order already created" });
     }
-
-    /* ------------------ SAFE LINE ITEMS ------------------ */
-
-    const lineItems = cart.map(item => {
-      if (!item.variant_id) {
-        throw new Error("Invalid variant_id in cart");
-      }
-
-      return {
-        variant_id: item.variant_id,
-        quantity: item.quantity || 1,
-
-        /// ✅ SAFE PRICE (CRITICAL FIX)
-        price: String(item.price || "1.00"),
-
-        properties: [
-          { name: "image", value: item.image || "" },
-          { name: "mrp", value: item.compare_at_price || "" }
-        ]
-      };
-    });
 
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
 
@@ -863,11 +798,16 @@ app.post("/api/payment/verify", async (req, res) => {
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
-          line_items: lineItems,
+          line_items: cart,
 
           financial_status: "paid",
-          fulfillment_status: "unfulfilled",
-          inventory_behaviour: "decrement_obeying_policy",
+
+          customer: {
+            first_name,
+            last_name,
+            email,
+            phone,
+          },
 
           email,
 
@@ -893,22 +833,13 @@ app.post("/api/payment/verify", async (req, res) => {
             phone,
           },
 
-          /// ✅ SHIPPING
           shipping_lines: [
             {
-              title: "Shipping",
-              price: String(shipping || 0),
+              title: "Free Shipping",
+              price: "0.00",
+              code: "FREE",
             },
           ],
-
-          /// ✅ COUPON
-          discount_codes: coupon_discount > 0 ? [
-            {
-              code: "COUPON",
-              amount: String(coupon_discount),
-              type: "fixed_amount"
-            }
-          ] : [],
 
           transactions: [
             {
@@ -920,45 +851,34 @@ app.post("/api/payment/verify", async (req, res) => {
           ],
 
           tags: "razorpay,upi",
+
           gateway: "Razorpay",
 
-          /// ✅ SAVE BREAKDOWN
-          note: `
-Razorpay Payment ID: ${razorpay_payment_id}
-MRP: ${total_mrp}
-Discount: ${discount}
-Coupon: ${coupon_discount}
-Shipping: ${shipping}
-`,
+          /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
+          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
 
           processing_method: "direct",
         },
       },
       {
         headers: {
-          "X-Shopify-Access-Token":
-            process.env.SHOPIFY_ADMIN_TOKEN,
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
         },
       }
     );
 
-    return res.json({
+    res.json({
       success: true,
       order: shopifyOrder.data.order,
     });
 
   } catch (err) {
-    console.error(
-      "🔥 VERIFY ERROR:",
-      err.response?.data || err.message
-    );
+    console.error("Payment verify error:", err.response?.data || err.message);
 
-    return res.status(500).json({
-      success: false,
-      message: err.response?.data || err.message,
-    });
+    res.json({ success: false });
   }
 });
+
  
 
 /* ------------------ START SERVER ------------------ */
