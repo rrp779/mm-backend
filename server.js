@@ -733,7 +733,7 @@ app.post("/api/payment/create-order", async (req, res) => {
     res.status(500).json({ error: "Payment order failed" });
   }
 });
-
+ 
 /* ------------------ VERIFY PAYMENT ------------------ */
 
 app.post("/api/payment/verify", async (req, res) => {
@@ -751,10 +751,14 @@ app.post("/api/payment/verify", async (req, res) => {
       city,
       state,
       pincode,
-      amount
+      amount,
+      total_mrp,
+      discount,
+      coupon_discount,
+      shipping
     } = req.body;
 
-    /* ------------------ BASIC VALIDATION ------------------ */
+    /* ------------------ VALIDATION ------------------ */
 
     if (
       !razorpay_order_id ||
@@ -788,7 +792,7 @@ app.post("/api/payment/verify", async (req, res) => {
       });
     }
 
-    /* ------------------ FETCH ORDER FROM RAZORPAY ------------------ */
+    /* ------------------ FETCH RAZORPAY ORDER ------------------ */
 
     const razorpayOrder = await razorpay.orders.fetch(
       razorpay_order_id
@@ -796,13 +800,20 @@ app.post("/api/payment/verify", async (req, res) => {
 
     let cart = [];
 
-try {
-  cart = JSON.parse(razorpayOrder.notes.cart || "[]");
-} catch (e) {
-  console.error("Cart parse error", e);
-}
+    try {
+      cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+    } catch (e) {
+      console.error("Cart parse error", e);
+    }
 
-    /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
+    if (!cart.length) {
+      return res.json({
+        success: false,
+        message: "Cart missing in Razorpay",
+      });
+    }
+
+    /* ------------------ DUPLICATE CHECK ------------------ */
 
     const existingOrders = await axios.get(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
@@ -825,17 +836,38 @@ try {
       });
     }
 
+    /* ------------------ SAFE LINE ITEMS ------------------ */
+
+    const lineItems = cart.map(item => {
+      if (!item.variant_id) {
+        throw new Error("Invalid variant_id in cart");
+      }
+
+      return {
+        variant_id: item.variant_id,
+        quantity: item.quantity || 1,
+
+        /// ✅ SAFE PRICE (CRITICAL FIX)
+        price: String(item.price || "1.00"),
+
+        properties: [
+          { name: "image", value: item.image || "" },
+          { name: "mrp", value: item.compare_at_price || "" }
+        ]
+      };
+    });
+
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
 
     const shopifyOrder = await axios.post(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
-          line_items: cart,
+          line_items: lineItems,
 
           financial_status: "paid",
-
-          
+          fulfillment_status: "unfulfilled",
+          inventory_behaviour: "decrement_obeying_policy",
 
           email,
 
@@ -861,13 +893,22 @@ try {
             phone,
           },
 
+          /// ✅ SHIPPING
           shipping_lines: [
             {
-              title: "Free Shipping",
-              price: "0.00",
-              code: "FREE",
+              title: "Shipping",
+              price: String(shipping || 0),
             },
           ],
+
+          /// ✅ COUPON
+          discount_codes: coupon_discount > 0 ? [
+            {
+              code: "COUPON",
+              amount: String(coupon_discount),
+              type: "fixed_amount"
+            }
+          ] : [],
 
           transactions: [
             {
@@ -881,7 +922,14 @@ try {
           tags: "razorpay,upi",
           gateway: "Razorpay",
 
-          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
+          /// ✅ SAVE BREAKDOWN
+          note: `
+Razorpay Payment ID: ${razorpay_payment_id}
+MRP: ${total_mrp}
+Discount: ${discount}
+Coupon: ${coupon_discount}
+Shipping: ${shipping}
+`,
 
           processing_method: "direct",
         },
@@ -901,13 +949,13 @@ try {
 
   } catch (err) {
     console.error(
-      "Payment verify error:",
+      "🔥 VERIFY ERROR:",
       err.response?.data || err.message
     );
 
-    return res.json({
+    return res.status(500).json({
       success: false,
-      error: err.response?.data || err.message,
+      message: err.response?.data || err.message,
     });
   }
 });
