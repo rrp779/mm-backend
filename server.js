@@ -850,6 +850,8 @@ const lineItems = cart.map(item => ({
       line_items: lineItems,
 
       financial_status: "paid",
+        inventory_behaviour: "decrement_obeying_policy",
+
       email,
 
       billing_address: {
