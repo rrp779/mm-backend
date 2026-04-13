@@ -751,7 +751,11 @@ app.post("/api/payment/verify", async (req, res) => {
       city,
       state,
       pincode,
-      amount
+      amount,
+      total_mrp,
+  discount,
+  coupon_discount,
+  shipping
     } = req.body;
 
     /* ------------------ BASIC VALIDATION ------------------ */
@@ -826,73 +830,98 @@ try {
     }
 
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
+const lineItems = cart.map(item => ({
+  variant_id: item.variant_id,
+  quantity: item.quantity,
 
-    const shopifyOrder = await axios.post(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
-      {
-        order: {
-          line_items: cart,
+  /// ✅ FIX PRICE (REQUIRED FOR TOTALS)
+  price: item.price,
 
-          financial_status: "paid",
+  /// ✅ STORE EXTRA DATA
+  properties: [
+    { name: "image", value: item.image || "" },
+    { name: "mrp", value: item.compare_at_price || "" }
+  ]
+})); 
+   const shopifyOrder = await axios.post(
+  `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
+  {
+    order: {
+      line_items: lineItems,
 
-          
+      financial_status: "paid",
+      email,
 
-          email,
-
-          billing_address: {
-            first_name,
-            last_name,
-            address1,
-            city,
-            province: state,
-            country: "India",
-            zip: pincode,
-            phone,
-          },
-
-          shipping_address: {
-            first_name,
-            last_name,
-            address1,
-            city,
-            province: state,
-            country: "India",
-            zip: pincode,
-            phone,
-          },
-
-          shipping_lines: [
-            {
-              title: "Free Shipping",
-              price: "0.00",
-              code: "FREE",
-            },
-          ],
-
-          transactions: [
-            {
-              kind: "sale",
-              status: "success",
-              amount: (amount / 100).toString(),
-              gateway: "Razorpay",
-            },
-          ],
-
-          tags: "razorpay,upi",
-          gateway: "Razorpay",
-
-          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
-
-          processing_method: "direct",
-        },
+      billing_address: {
+        first_name,
+        last_name,
+        address1,
+        city,
+        province: state,
+        country: "India",
+        zip: pincode,
+        phone,
       },
-      {
-        headers: {
-          "X-Shopify-Access-Token":
-            process.env.SHOPIFY_ADMIN_TOKEN,
+
+      shipping_address: {
+        first_name,
+        last_name,
+        address1,
+        city,
+        province: state,
+        country: "India",
+        zip: pincode,
+        phone,
+      },
+
+      /// ✅ SHIPPING FIX
+      shipping_lines: [
+        {
+          title: "Shipping",
+          price: (shipping || 0).toString(),
         },
-      }
-    );
+      ],
+
+      /// ✅ COUPON FIX
+      discount_codes: coupon_discount > 0 ? [
+        {
+          code: "COUPON",
+          amount: coupon_discount.toString(),
+          type: "fixed_amount"
+        }
+      ] : [],
+
+      transactions: [
+        {
+          kind: "sale",
+          status: "success",
+          amount: (amount / 100).toString(),
+          gateway: "Razorpay",
+        },
+      ],
+
+      tags: "razorpay,upi",
+      gateway: "Razorpay",
+
+      /// ✅ SAVE FULL BREAKDOWN
+      note: `
+Razorpay Payment ID: ${razorpay_payment_id}
+MRP: ${total_mrp}
+Discount: ${discount}
+Coupon: ${coupon_discount}
+Shipping: ${shipping}
+`,
+
+      processing_method: "direct",
+    },
+  },
+  {
+    headers: {
+      "X-Shopify-Access-Token":
+        process.env.SHOPIFY_ADMIN_TOKEN,
+    },
+  }
+); 
 
     return res.json({
       success: true,
