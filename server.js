@@ -707,42 +707,12 @@ app.get("/api/shopify/collections", async (req, res) => {
 
 app.post("/api/payment/create-order", async (req, res) => {
   try {
-    const { amount, cart, email, phone, discount = 0 } = req.body;
+    const { amount, cart, email, phone } = req.body;
 
     const receiptId = "order_" + Date.now();
 
-    /* ------------------ SHIPPING CALCULATION ------------------ */
-
-    const subtotal = cart.reduce((sum, item) => {
-      const price =
-        Number(item.price) ||
-        Number(item.variant?.price) ||
-        0;
-
-      const qty = Number(item.quantity || 1);
-
-      return sum + (price * qty);
-    }, 0);
-
-    /// ✅ APPLY DISCOUNT
-    const discountValue = Number(discount || 0);
-
-    const finalAmountRupees = subtotal - discountValue;
-
-    /// ❗ SAFETY CHECK
-    if (!finalAmountRupees || finalAmountRupees <= 0) {
-      return res.status(400).json({
-        error: "Invalid amount",
-        subtotal,
-        discountValue,
-      });
-    }
-
-    /// ✅ CONVERT TO PAISE
-    const finalAmount = Math.round(finalAmountRupees * 100); 
-
     const options = {
-      amount: finalAmount,
+      amount,
       currency: "INR",
       receipt: receiptId,
 
@@ -751,11 +721,6 @@ app.post("/api/payment/create-order", async (req, res) => {
         phone,
         cart: JSON.stringify(cart),
         receipt: receiptId,
-
-        // ✅ store shipping for later
-        
-        subtotal: subtotal.toString(),
-        discount: discount.toString(), 
       },
     };
 
@@ -767,7 +732,7 @@ app.post("/api/payment/create-order", async (req, res) => {
     console.error("Razorpay order error:", error);
     res.status(500).json({ error: "Payment order failed" });
   }
-}); 
+});
  
 /* ------------------ VERIFY PAYMENT ------------------ */
 
@@ -808,16 +773,6 @@ app.post("/api/payment/verify", async (req, res) => {
 
     const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
 
-
-
-    /* ------------------ ✅ ADD SHIPPING LOGIC ------------------ */
-
-const shippingPrice = 0;
-const shippingTitle = "Free Shipping";
-const discount = parseFloat(razorpayOrder.notes.discount || "0");
-
-/* ------------------ ✅ END ------------------ */
-
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
     const existingOrder = await axios.get(
@@ -843,21 +798,9 @@ const discount = parseFloat(razorpayOrder.notes.discount || "0");
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
-          line_items: cart.map(item => ({
-  variant_id: item.variant_id,
-  quantity: item.quantity,
-
-  // optional but good for safety
-  price: item.price,
-  title: item.title,
-
-  // 🔥 THIS IS IMPORTANT
-  image: item.image, // 👈 add this line
-})),
+          line_items: cart,
 
           financial_status: "paid",
-
-          total_discounts: discount.toFixed(2),
 
           customer: {
             first_name,
@@ -890,13 +833,13 @@ const discount = parseFloat(razorpayOrder.notes.discount || "0");
             phone,
           },
 
-        shipping_lines: [
-  {
-    title: "Free Shipping",
-    price: "0.00",
-    code: "FREE",
-  },
-],
+          shipping_lines: [
+            {
+              title: "Free Shipping",
+              price: "0.00",
+              code: "FREE",
+            },
+          ],
 
           transactions: [
             {
@@ -912,7 +855,7 @@ const discount = parseFloat(razorpayOrder.notes.discount || "0");
           gateway: "Razorpay",
 
           /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
-         note: `Razorpay Payment ID: ${razorpay_payment_id}`,
+          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
 
           processing_method: "direct",
         },
