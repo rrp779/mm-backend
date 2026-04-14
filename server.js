@@ -775,14 +775,14 @@ app.post("/api/payment/verify", async (req, res) => {
 
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
-    const existingOrder = await axios.get(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=1&fields=id,note`,
-      {
-        headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-        },
-      }
-    );
+   const existingOrder = await axios.get(
+  `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
+  {
+    headers: {
+      "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+    },
+  }
+); 
 
     const alreadyExists = existingOrder.data.orders.some(o =>
       o.note?.includes(razorpay_payment_id)
@@ -798,67 +798,92 @@ app.post("/api/payment/verify", async (req, res) => {
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
-          line_items: cart,
+  line_items: cart.map(item => ({
+    variant_id: item.variant_id,
+    quantity: item.quantity,
+  })),
 
-          financial_status: "paid",
+  financial_status: "paid",
 
-          customer: {
-            first_name,
-            last_name,
-            email,
-            phone,
-          },
+  customer: {
+    first_name,
+    last_name,
+    email,
+    phone,
+  },
 
-          email,
+  email,
 
-          billing_address: {
-            first_name,
-            last_name,
-            address1,
-            city,
-            province: state,
-            country: "India",
-            zip: pincode,
-            phone,
-          },
+  billing_address: {
+    first_name,
+    last_name,
+    address1,
+    city,
+    province: state,
+    country: "India",
+    zip: pincode,
+    phone,
+  },
 
-          shipping_address: {
-            first_name,
-            last_name,
-            address1,
-            city,
-            province: state,
-            country: "India",
-            zip: pincode,
-            phone,
-          },
+  shipping_address: {
+    first_name,
+    last_name,
+    address1,
+    city,
+    province: state,
+    country: "India",
+    zip: pincode,
+    phone,
+  },
 
-          shipping_lines: [
-            {
-              title: "Free Shipping",
-              price: "0.00",
-              code: "FREE",
-            },
-          ],
+  shipping_lines: [
+    {
+      title: "Free Shipping",
+      price: "0.00",
+    },
+  ],
 
-          transactions: [
-            {
-              kind: "sale",
-              status: "success",
-              amount: (amount / 100).toString(),
-              gateway: "Razorpay",
-            },
-          ],
+  transactions: [
+    {
+      kind: "sale",
+      status: "success",
+      amount: (amount / 100).toString(),
+      gateway: "Razorpay",
+    },
+  ],
 
-          tags: "razorpay,upi",
+  tags: "razorpay,upi",
 
-          gateway: "Razorpay",
+  gateway: "Razorpay",
 
-          /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
-          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
+  /* ✅ VERY IMPORTANT ADDITIONS BELOW */
 
-          processing_method: "direct",
-        },
+  note: `Razorpay Payment ID: ${razorpay_payment_id}`,
+
+  note_attributes: [
+    { name: "Payment ID", value: razorpay_payment_id },
+    { name: "Order ID", value: razorpay_order_id },
+    { name: "Customer Phone", value: phone },
+    { name: "Receipt", value: razorpayOrder.receipt },
+  ],
+
+  metafields: [
+    {
+      namespace: "custom",
+      key: "razorpay_payment_id",
+      value: razorpay_payment_id,
+      type: "single_line_text_field",
+    },
+    {
+      namespace: "custom",
+      key: "cart_data",
+      value: JSON.stringify(cart),
+      type: "json",
+    },
+  ],
+
+  processing_method: "direct",
+},
       },
       {
         headers: {
