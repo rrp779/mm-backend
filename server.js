@@ -23,6 +23,7 @@ const razorpay = new Razorpay({
 });
 
 
+
 app.use(cors());
 app.use(express.json());
 
@@ -63,33 +64,57 @@ const SectionSchema = new mongoose.Schema({
 
 const Section = mongoose.model("Section", SectionSchema);
 
+
+const multer = require("multer");
+const ImageKit = require("imagekit");
+
+const upload = multer(); // memory storage
+
+const imagekit = new ImageKit({
+  publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+  privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT,
+});
 /* ------------------ IMAGE UPLOAD ------------------ */
-const storage = multer.diskStorage({
-  destination: "./uploads/",
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
-  },
+app.post("/api/upload", upload.single("image"), async (req, res) => {
+  try {
+    const file = req.file;
+
+    const response = await imagekit.upload({
+      file: file.buffer,
+      fileName: Date.now() + "_" + file.originalname,
+      folder: "uploads",
+    });
+
+    res.json({
+      imageUrl: response.url, // ✅ CLOUD URL
+    });
+
+  } catch (err) {
+    console.error("Image upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
 });
 
-const upload = multer({ storage });
+app.post("/api/upload-video", upload.single("video"), async (req, res) => {
+  try {
+    const file = req.file;
 
-app.use("/uploads", express.static("uploads"));
+    const response = await imagekit.upload({
+      file: file.buffer,
+      fileName: Date.now() + "_" + file.originalname,
+      folder: "videos",
+    });
 
-app.post("/api/upload", upload.single("image"), (req, res) => {
-  res.json({
-    imageUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`
-  });
+    res.json({
+      videoUrl: response.url, // ✅ CLOUD URL
+    });
+
+  } catch (err) {
+    console.error("Video upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
 });
-
-/* ------------------ VIDEO UPLOAD ------------------ */
- 
-app.post("/api/upload-video", upload.single("video"), (req,res)=>{
-
- res.json({
-  videoUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`
- })
-
-})
 
 /* ================= SECTION API ================= */
 
@@ -265,7 +290,7 @@ app.get("/api/shopify/collections", async (req, res) => {
     console.error("Collections error:", err.message);
     res.status(500).json([]);
   }
-});
+}); 
 
 /* ================= SHOPIFY SEARCH (CACHED) ================= */
 
