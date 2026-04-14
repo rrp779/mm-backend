@@ -714,17 +714,15 @@ app.post("/api/payment/create-order", async (req, res) => {
     /* ------------------ SHIPPING CALCULATION ------------------ */
 
     const subtotal = cart.reduce((sum, item) => {
-      return sum + (Number(item.price) * Number(item.quantity || 1));
-    }, 0);
+  return sum + (Number(item.price) * Number(item.quantity || 1));
+}, 0);
 
-    let shipping = 0;
-    if (subtotal < 1500) {
-      shipping = 80;
-    }
+let shipping = 0;
+if (subtotal < 1500) {
+  shipping = 80;
+}
 
-    /* ------------------ IMPORTANT ------------------ */
-    // 👉 Use frontend amount (fix ₹1 issue)
-    const finalAmount = amount;
+const finalAmount = Math.round((subtotal + shipping) * 100); 
 
     const options = {
       amount: finalAmount,
@@ -792,7 +790,7 @@ app.post("/api/payment/verify", async (req, res) => {
 
     const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
 
-    
+
 
     /* ------------------ ✅ ADD SHIPPING LOGIC ------------------ */
 
