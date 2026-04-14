@@ -707,7 +707,7 @@ app.get("/api/shopify/collections", async (req, res) => {
 
 app.post("/api/payment/create-order", async (req, res) => {
   try {
-    const { amount, cart, email, phone } = req.body;
+    const { amount, cart, email, phone, discount = 0 } = req.body;
 
     const receiptId = "order_" + Date.now();
 
@@ -722,7 +722,8 @@ if (subtotal < 1500) {
   shipping = 80;
 }
 
-const finalAmount = Math.round((subtotal + shipping) * 100); 
+// ✅ FINAL FIX
+const finalAmount = amount + (shipping * 100);
 
     const options = {
       amount: finalAmount,
@@ -738,6 +739,7 @@ const finalAmount = Math.round((subtotal + shipping) * 100);
         // ✅ store shipping for later
         shipping: shipping.toString(),
         subtotal: subtotal.toString(),
+        discount: discount.toString(), 
       },
     };
 
@@ -800,6 +802,8 @@ const shippingPrice = parseFloat(razorpayOrder.notes.shipping || "0");
 const shippingTitle =
   shippingPrice === 0 ? "Free Shipping" : "Flat Shipping";
 
+  const discount = parseFloat(razorpayOrder.notes.discount || "0");
+
 /* ------------------ ✅ END ------------------ */
 
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
@@ -840,6 +844,8 @@ const shippingTitle =
 })),
 
           financial_status: "paid",
+
+          total_discounts: discount.toFixed(2),
 
           customer: {
             first_name,
