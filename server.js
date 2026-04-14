@@ -83,6 +83,7 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
       file: file.buffer,
       fileName: Date.now() + "_" + file.originalname,
       folder: "uploads",
+      useUniqueFileName: true,
     });
 
     res.json({
