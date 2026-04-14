@@ -713,7 +713,33 @@ app.post("/api/payment/create-order", async (req, res) => {
 
     /* ------------------ SHIPPING CALCULATION ------------------ */
 
-   const finalAmount = amount;
+    const subtotal = cart.reduce((sum, item) => {
+      const price =
+        Number(item.price) ||
+        Number(item.variant?.price) ||
+        0;
+
+      const qty = Number(item.quantity || 1);
+
+      return sum + (price * qty);
+    }, 0);
+
+    /// ✅ APPLY DISCOUNT
+    const discountValue = Number(discount || 0);
+
+    const finalAmountRupees = subtotal - discountValue;
+
+    /// ❗ SAFETY CHECK
+    if (!finalAmountRupees || finalAmountRupees <= 0) {
+      return res.status(400).json({
+        error: "Invalid amount",
+        subtotal,
+        discountValue,
+      });
+    }
+
+    /// ✅ CONVERT TO PAISE
+    const finalAmount = Math.round(finalAmountRupees * 100); 
 
     const options = {
       amount: finalAmount,
@@ -887,7 +913,7 @@ const discount = parseFloat(razorpayOrder.notes.discount || "0");
 
           /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
-          
+
           processing_method: "direct",
         },
       },
