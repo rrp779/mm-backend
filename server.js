@@ -711,8 +711,24 @@ app.post("/api/payment/create-order", async (req, res) => {
 
     const receiptId = "order_" + Date.now();
 
+    /* ------------------ ✅ ADD THIS BLOCK ------------------ */
+
+    const subtotal = cart.reduce((sum, item) => {
+      return sum + (parseFloat(item.price) * item.quantity);
+    }, 0);
+
+    let shipping = 0;
+
+    if (subtotal < 1500) {
+      shipping = 80;
+    }
+
+    const finalAmount = Math.round((subtotal + shipping) * 100);
+
+    /* ------------------ ✅ END ------------------ */
+
     const options = {
-      amount,
+      amount: finalAmount, // ✅ updated
       currency: "INR",
       receipt: receiptId,
 
@@ -721,6 +737,10 @@ app.post("/api/payment/create-order", async (req, res) => {
         phone,
         cart: JSON.stringify(cart),
         receipt: receiptId,
+
+        /* ✅ ADD THIS */
+        shipping: shipping.toString(),
+        subtotal: subtotal.toString(),
       },
     };
 
@@ -773,6 +793,16 @@ app.post("/api/payment/verify", async (req, res) => {
 
     const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
 
+    /* ------------------ ✅ ADD SHIPPING LOGIC ------------------ */
+
+const subtotal = parseFloat(razorpayOrder.notes.subtotal || "0");
+const shippingPrice = parseFloat(razorpayOrder.notes.shipping || "0");
+
+const shippingTitle =
+  shippingPrice === 0 ? "Free Shipping" : "Flat Shipping";
+
+/* ------------------ ✅ END ------------------ */
+
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
     const existingOrder = await axios.get(
@@ -798,7 +828,17 @@ app.post("/api/payment/verify", async (req, res) => {
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
-          line_items: cart,
+          line_items: cart.map(item => ({
+  variant_id: item.variant_id,
+  quantity: item.quantity,
+
+  // optional but good for safety
+  price: item.price,
+  title: item.title,
+
+  // 🔥 THIS IS IMPORTANT
+  image: item.image, // 👈 add this line
+})),
 
           financial_status: "paid",
 
@@ -834,12 +874,12 @@ app.post("/api/payment/verify", async (req, res) => {
           },
 
           shipping_lines: [
-            {
-              title: "Free Shipping",
-              price: "0.00",
-              code: "FREE",
-            },
-          ],
+  {
+    title: shippingTitle,
+    price: shippingPrice.toFixed(2),
+    code: shippingPrice === 0 ? "FREE" : "FLAT",
+  },
+],
 
           transactions: [
             {
@@ -855,7 +895,7 @@ app.post("/api/payment/verify", async (req, res) => {
           gateway: "Razorpay",
 
           /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
-          note: `Razorpay Payment ID: ${razorpay_payment_id}`,
+         note: `Razorpay Payment ID: ${razorpay_payment_id} | Shipping: ₹${shippingPrice}`,
 
           processing_method: "direct",
         },
