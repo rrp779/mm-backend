@@ -711,24 +711,23 @@ app.post("/api/payment/create-order", async (req, res) => {
 
     const receiptId = "order_" + Date.now();
 
-    /* ------------------ ✅ ADD THIS BLOCK ------------------ */
+    /* ------------------ SHIPPING CALCULATION ------------------ */
 
     const subtotal = cart.reduce((sum, item) => {
-      return sum + (parseFloat(item.price) * item.quantity);
+      return sum + (Number(item.price) * Number(item.quantity || 1));
     }, 0);
 
     let shipping = 0;
-
     if (subtotal < 1500) {
       shipping = 80;
     }
 
-    const finalAmount = Math.round((subtotal + shipping) * 100);
-
-    /* ------------------ ✅ END ------------------ */
+    /* ------------------ IMPORTANT ------------------ */
+    // 👉 Use frontend amount (fix ₹1 issue)
+    const finalAmount = amount;
 
     const options = {
-      amount: finalAmount, // ✅ updated
+      amount: finalAmount,
       currency: "INR",
       receipt: receiptId,
 
@@ -738,7 +737,7 @@ app.post("/api/payment/create-order", async (req, res) => {
         cart: JSON.stringify(cart),
         receipt: receiptId,
 
-        /* ✅ ADD THIS */
+        // ✅ store shipping for later
         shipping: shipping.toString(),
         subtotal: subtotal.toString(),
       },
@@ -752,7 +751,7 @@ app.post("/api/payment/create-order", async (req, res) => {
     console.error("Razorpay order error:", error);
     res.status(500).json({ error: "Payment order failed" });
   }
-});
+}); 
  
 /* ------------------ VERIFY PAYMENT ------------------ */
 
@@ -792,6 +791,8 @@ app.post("/api/payment/verify", async (req, res) => {
     const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
 
     const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+
+    
 
     /* ------------------ ✅ ADD SHIPPING LOGIC ------------------ */
 
