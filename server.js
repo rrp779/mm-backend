@@ -713,17 +713,7 @@ app.post("/api/payment/create-order", async (req, res) => {
 
     /* ------------------ SHIPPING CALCULATION ------------------ */
 
-    const subtotal = cart.reduce((sum, item) => {
-  return sum + (Number(item.price) * Number(item.quantity || 1));
-}, 0);
-
-let shipping = 0;
-if (subtotal < 1500) {
-  shipping = 80;
-}
-
-// ✅ FINAL FIX
-const finalAmount = amount + (shipping * 100);
+   const finalAmount = amount;
 
     const options = {
       amount: finalAmount,
@@ -737,7 +727,7 @@ const finalAmount = amount + (shipping * 100);
         receipt: receiptId,
 
         // ✅ store shipping for later
-        shipping: shipping.toString(),
+        
         subtotal: subtotal.toString(),
         discount: discount.toString(), 
       },
@@ -796,13 +786,9 @@ app.post("/api/payment/verify", async (req, res) => {
 
     /* ------------------ ✅ ADD SHIPPING LOGIC ------------------ */
 
-const subtotal = parseFloat(razorpayOrder.notes.subtotal || "0");
-const shippingPrice = parseFloat(razorpayOrder.notes.shipping || "0");
-
-const shippingTitle =
-  shippingPrice === 0 ? "Free Shipping" : "Flat Shipping";
-
-  const discount = parseFloat(razorpayOrder.notes.discount || "0");
+const shippingPrice = 0;
+const shippingTitle = "Free Shipping";
+const discount = parseFloat(razorpayOrder.notes.discount || "0");
 
 /* ------------------ ✅ END ------------------ */
 
@@ -878,11 +864,11 @@ const shippingTitle =
             phone,
           },
 
-          shipping_lines: [
+        shipping_lines: [
   {
-    title: shippingTitle,
-    price: shippingPrice.toFixed(2),
-    code: shippingPrice === 0 ? "FREE" : "FLAT",
+    title: "Free Shipping",
+    price: "0.00",
+    code: "FREE",
   },
 ],
 
@@ -900,8 +886,8 @@ const shippingTitle =
           gateway: "Razorpay",
 
           /* 🔥 IMPORTANT: UNIQUE IDENTIFIER */
-         note: `Razorpay Payment ID: ${razorpay_payment_id} | Shipping: ₹${shippingPrice}`,
-
+         note: `Razorpay Payment ID: ${razorpay_payment_id}`,
+         
           processing_method: "direct",
         },
       },
