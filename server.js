@@ -64,8 +64,7 @@ const SectionSchema = new mongoose.Schema({
 
 const Section = mongoose.model("Section", SectionSchema);
 
-
-const multer = require("multer");
+ 
 const ImageKit = require("imagekit");
 
 const upload = multer(); // memory storage
