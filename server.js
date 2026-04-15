@@ -923,10 +923,9 @@ app.post("/api/payment/verify", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Payment verify error:", err.response?.data || err.message);
-
-    res.json({ success: false });
-  }
+  console.error("FULL ERROR:", err);
+  res.json({ success: false, message: err.message });
+} 
 });
 
  
