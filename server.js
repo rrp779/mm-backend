@@ -13,6 +13,7 @@ const app = express();
 
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
+const PDFDocument = require("pdfkit");
 
 const NodeCache = require("node-cache");
 const cache = new NodeCache({ stdTTL: 60 });  
@@ -26,6 +27,237 @@ const razorpay = new Razorpay({
 
 app.use(cors());
 app.use(express.json());
+
+function toOrderGid(id) {
+  const raw = decodeURIComponent(String(id || "")).trim();
+  if (!raw) return null;
+
+  if (raw.startsWith("gid://shopify/Order/")) return raw;
+
+  if (/^\d+$/.test(raw)) {
+    return `gid://shopify/Order/${raw}`;
+  }
+
+  // If caller sends an already-URL-encoded gid (or other gid), allow only Order gids.
+  if (raw.startsWith("gid://")) {
+    return raw.includes("gid://shopify/Order/") ? raw : null;
+  }
+
+  return null;
+}
+
+function formatMoney(amount, currency = "INR") {
+  const num = Number(amount || 0);
+  if (Number.isNaN(num)) return `${currency} 0.00`;
+  return `${currency} ${num.toFixed(2)}`;
+}
+
+async function fetchOrderForInvoice(orderGid) {
+  const url = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`;
+
+  const response = await axios.post(
+    url,
+    {
+      query: `
+        query OrderForInvoice($id: ID!) {
+          order(id: $id) {
+            id
+            name
+            createdAt
+            processedAt
+            displayFinancialStatus
+            displayFulfillmentStatus
+
+            customer {
+              firstName
+              lastName
+              email
+              phone
+            }
+
+            shippingAddress {
+              name
+              address1
+              address2
+              city
+              province
+              country
+              zip
+              phone
+            }
+
+            subtotalPriceSet { shopMoney { amount currencyCode } }
+            totalShippingPriceSet { shopMoney { amount currencyCode } }
+            currentTotalPriceSet { shopMoney { amount currencyCode } }
+            totalTaxSet { shopMoney { amount currencyCode } }
+
+            lineItems(first: 50) {
+              edges {
+                node {
+                  title
+                  quantity
+                  variantTitle
+                  originalUnitPriceSet { shopMoney { amount currencyCode } }
+                }
+              }
+            }
+          }
+        }
+      `,
+      variables: { id: orderGid },
+    },
+    {
+      headers: {
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+    }
+  );
+
+  const data = response.data;
+  if (data?.errors?.length) {
+    const msg = data.errors[0]?.message || "Shopify GraphQL error";
+    const err = new Error(msg);
+    err.shopifyErrors = data.errors;
+    throw err;
+  }
+
+  return data?.data?.order || null;
+}
+
+function buildInvoicePdfBuffer(order) {
+  const doc = new PDFDocument({ size: "A4", margin: 40 });
+
+  const chunks = [];
+  doc.on("data", (c) => chunks.push(c));
+
+  const done = new Promise((resolve, reject) => {
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+  });
+
+  const name = order?.name || "Order";
+  const processedAt = order?.processedAt || order?.createdAt || null;
+  const dateStr = processedAt ? new Date(processedAt).toISOString().slice(0, 10) : "";
+
+  const ship = order?.shippingAddress || {};
+  const customer = order?.customer || {};
+
+  const currency =
+    order?.currentTotalPriceSet?.shopMoney?.currencyCode ||
+    order?.subtotalPriceSet?.shopMoney?.currencyCode ||
+    "INR";
+
+  const subtotal = Number(order?.subtotalPriceSet?.shopMoney?.amount || 0);
+  const shipping = Number(order?.totalShippingPriceSet?.shopMoney?.amount || 0);
+  const tax = Number(order?.totalTaxSet?.shopMoney?.amount || 0);
+  const total = Number(order?.currentTotalPriceSet?.shopMoney?.amount || 0);
+  const discount = Math.max(0, subtotal + shipping + tax - total);
+
+  doc.fontSize(22).text("Invoice", { continued: false });
+  doc.moveDown(0.3);
+
+  doc.fontSize(11).fillColor("#444444");
+  doc.text(`Order: ${name}`);
+  if (dateStr) doc.text(`Date: ${dateStr}`);
+  doc.text(`Payment: ${order?.displayFinancialStatus || "-"}`);
+  doc.text(`Fulfillment: ${order?.displayFulfillmentStatus || "-"}`);
+
+  doc.moveDown(0.8);
+  doc.fillColor("#000000");
+  doc.fontSize(12).text("Customer Details", { underline: true });
+  doc.moveDown(0.2);
+  const custName = [customer.firstName, customer.lastName].filter(Boolean).join(" ").trim();
+  doc.fontSize(10);
+  doc.text(custName || ship.name || "-");
+  if (customer.email) doc.text(customer.email);
+  if (customer.phone || ship.phone) doc.text(customer.phone || ship.phone);
+
+  doc.moveDown(0.8);
+  doc.fontSize(12).text("Shipping Address", { underline: true });
+  doc.moveDown(0.2);
+  doc.fontSize(10);
+  const addrLines = [
+    ship.name,
+    ship.address1,
+    ship.address2,
+    [ship.city, ship.province, ship.zip].filter(Boolean).join(", "),
+    ship.country,
+    ship.phone ? `Phone: ${ship.phone}` : null,
+  ].filter((l) => l && String(l).trim().length > 0);
+  if (addrLines.length === 0) {
+    doc.text("-");
+  } else {
+    addrLines.forEach((l) => doc.text(l));
+  }
+
+  doc.moveDown(1.0);
+  doc.fontSize(12).text("Items", { underline: true });
+  doc.moveDown(0.5);
+
+  const tableTop = doc.y;
+  const colTitleX = 40;
+  const colQtyX = 340;
+  const colUnitX = 390;
+  const colTotalX = 470;
+
+  doc.fontSize(10).fillColor("#000000");
+  doc.text("Item", colTitleX, tableTop);
+  doc.text("Qty", colQtyX, tableTop, { width: 40, align: "right" });
+  doc.text("Unit", colUnitX, tableTop, { width: 70, align: "right" });
+  doc.text("Total", colTotalX, tableTop, { width: 80, align: "right" });
+
+  doc.moveTo(40, tableTop + 14).lineTo(555, tableTop + 14).strokeColor("#dddddd").stroke();
+
+  let y = tableTop + 22;
+  const edges = order?.lineItems?.edges || [];
+
+  edges.forEach((edge) => {
+    const node = edge?.node || {};
+    const qty = Number(node.quantity || 0);
+    const unit = Number(node?.originalUnitPriceSet?.shopMoney?.amount || 0);
+    const lineTotal = unit * qty;
+
+    doc.fontSize(10).fillColor("#000000");
+    doc.text(String(node.title || "Item"), colTitleX, y, { width: 285 });
+    doc.text(String(qty || 0), colQtyX, y, { width: 40, align: "right" });
+    doc.text(formatMoney(unit, currency), colUnitX, y, { width: 70, align: "right" });
+    doc.text(formatMoney(lineTotal, currency), colTotalX, y, { width: 80, align: "right" });
+
+    y += 18;
+    if (y > 720) {
+      doc.addPage();
+      y = 60;
+    }
+  });
+
+  doc.moveDown(1.0);
+  doc.y = Math.max(doc.y, y + 10);
+
+  const totalsX = 360;
+  doc.strokeColor("#dddddd").moveTo(totalsX, doc.y).lineTo(555, doc.y).stroke();
+  doc.moveDown(0.5);
+
+  function totalRow(label, value) {
+    doc.fontSize(10).fillColor("#444444").text(label, totalsX, doc.y, { width: 110 });
+    doc.fontSize(10).fillColor("#000000").text(value, totalsX + 110, doc.y, { width: 85, align: "right" });
+    doc.moveDown(0.3);
+  }
+
+  totalRow("Subtotal", formatMoney(subtotal, currency));
+  totalRow("Shipping", shipping === 0 ? "Free" : formatMoney(shipping, currency));
+  if (tax > 0) totalRow("Tax", formatMoney(tax, currency));
+  if (discount > 0) totalRow("Discount", `-${formatMoney(discount, currency)}`);
+
+  doc.moveDown(0.2);
+  doc.fontSize(11).fillColor("#000000").text("Total", totalsX, doc.y, { width: 110 });
+  doc.fontSize(11).fillColor("#000000").text(formatMoney(total, currency), totalsX + 110, doc.y, { width: 85, align: "right" });
+
+  doc.moveDown(1.0);
+  doc.fontSize(9).fillColor("#777777").text("This invoice is generated by MakeupMysteryIndia.", 40, doc.y);
+
+  doc.end();
+  return done;
+}
 
  
 /* ------------------ SCHEMA ------------------ */
@@ -631,6 +863,38 @@ app.get("/api/shopify/coupons", async (req, res) => {
 
     res.status(500).json([]);
 
+  }
+});
+
+/* ------------------ ORDER INVOICE (PDF) ------------------ */
+
+app.get("/api/order/:id/invoice", async (req, res) => {
+  try {
+    const orderGid = toOrderGid(req.params.id);
+
+    if (!orderGid) {
+      return res.status(400).json({ error: "Invalid order id" });
+    }
+
+    if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) {
+      return res.status(500).json({ error: "Shopify env vars not configured" });
+    }
+
+    const order = await fetchOrderForInvoice(orderGid);
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const pdfBuffer = await buildInvoicePdfBuffer(order);
+
+    const safeName = String(order?.name || "order").replace(/[^a-zA-Z0-9-_]/g, "");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="invoice-${safeName || "order"}.pdf"`);
+    return res.status(200).send(pdfBuffer);
+  } catch (err) {
+    console.error("Invoice Error:", err.response?.data || err.message);
+    return res.status(500).json({ error: "Invoice generation failed" });
   }
 });
 
