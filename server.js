@@ -17,11 +17,186 @@ const PDFDocument = require("pdfkit");
 
 const NodeCache = require("node-cache");
 const cache = new NodeCache({ stdTTL: 60 });  
+const Review = require("./models/Review");
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+const SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket_jwt";
+
+async function getShiprocketToken() {
+  const cached = cache.get(SHIPROCKET_TOKEN_CACHE_KEY);
+  if (cached) return cached;
+
+  if (!process.env.SHIPROCKET_EMAIL || !process.env.SHIPROCKET_PASSWORD) {
+    const err = new Error("Shiprocket env vars not configured");
+    err.code = "SHIPROCKET_ENV_MISSING";
+    throw err;
+  }
+
+  const response = await axios.post(
+    "https://apiv2.shiprocket.in/v1/external/auth/local/register/login",
+    {
+      email: process.env.SHIPROCKET_EMAIL,
+      password: process.env.SHIPROCKET_PASSWORD,
+    },
+    { timeout: 10000 }
+  );
+
+  const token = response?.data?.token;
+  if (!token) {
+    const err = new Error("Shiprocket auth failed");
+    err.data = response?.data;
+    throw err;
+  }
+
+  // Token is generally valid for 24h; cache for 23h to be safe.
+  cache.set(SHIPROCKET_TOKEN_CACHE_KEY, token, 23 * 60 * 60);
+  return token;
+}
+
+function normalizeShiprocketStatus(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+
+  // Shiprocket frequently returns short status codes.
+  // Map the requested codes to clean labels; otherwise return raw as-is.
+  const code = s.toUpperCase();
+  switch (code) {
+    case "DLVD":
+      return "Delivered";
+    case "OFD":
+      return "Out for Delivery";
+    case "PKD":
+      return "Picked Up";
+    case "IT":
+      return "In Transit";
+    case "RTO":
+      return "Return to Origin";
+    case "CANC":
+      return "Cancelled";
+    default:
+      // Common full-text variants (case-insensitive) — keep output consistent for timeline mapping.
+      if (code === "DELIVERED") return "Delivered";
+      if (code === "OUT FOR DELIVERY" || code === "OUT_FOR_DELIVERY") return "Out for Delivery";
+      if (code === "IN TRANSIT" || code === "IN_TRANSIT") return "In Transit";
+      if (code === "PICKED UP" || code === "PICKED_UP") return "Picked Up";
+      return s;
+  }
+}
+
+function toIsoDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+function toIsoDateOnly(value) {
+  const iso = toIsoDate(value);
+  return iso ? iso.slice(0, 10) : null;
+}
+
+function parseShiprocketDdMmmYyyyTime(value) {
+  const s = String(value || "").trim();
+  if (!s) return null;
+
+  // Expected like: "20 Jul, 2025 14:30" (may be with/without comma).
+  const m = s.match(/^(\d{1,2})\s+([A-Za-z]{3})[,]?\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return null;
+
+  const day = Number(m[1]);
+  const mon = String(m[2]).toLowerCase();
+  const year = Number(m[3]);
+  const hour = Number(m[4]);
+  const minute = Number(m[5]);
+  const second = m[6] ? Number(m[6]) : 0;
+
+  const monthMap = {
+    jan: 0,
+    feb: 1,
+    mar: 2,
+    apr: 3,
+    may: 4,
+    jun: 5,
+    jul: 6,
+    aug: 7,
+    sep: 8,
+    oct: 9,
+    nov: 10,
+    dec: 11,
+  };
+
+  const monthIndex = monthMap[mon];
+  if (monthIndex === undefined) return null;
+
+  // Shiprocket times are usually local; we keep it as local time and serialize to ISO.
+  const d = new Date(year, monthIndex, day, hour, minute, second);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function extractShiprocketEDD(payload) {
+  const etdRaw = payload?.tracking_data?.etd;
+  const d = parseShiprocketDdMmmYyyyTime(etdRaw);
+  if (!d) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+function extractShiprocketEvents(payload) {
+  const events = [];
+
+  const rawScans = payload?.tracking_data?.shipment_track_activities || [];
+
+  if (Array.isArray(rawScans)) {
+    for (const e of rawScans) {
+      const rawTime = e?.activity_date || null;
+      const parsed = parseShiprocketDdMmmYyyyTime(rawTime) || new Date(rawTime);
+      const time = parsed && !Number.isNaN(parsed.getTime()) ? parsed.toISOString() : null;
+
+      const location = e?.location || "";
+      const description = e?.activity || "";
+
+      if (time || location || description) {
+        events.push({
+          time,
+          location: String(location || ""),
+          description: String(description || ""),
+        });
+      }
+    }
+  }
+
+  return events;
+}
+
+async function fetchShiprocketTrackingByAwb(awb) {
+  const token = await getShiprocketToken();
+
+  const response = await axios.get(
+    `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${encodeURIComponent(String(awb))}`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 10000,
+    }
+  );
+
+  const payload = response?.data || {};
+
+  const statusRaw =
+    payload?.tracking_data?.current_status ||
+    payload?.tracking_data?.shipment_track?.[0]?.current_status ||
+    payload?.tracking_data?.shipment_track?.[0]?.status ||
+    "";
+
+  const status = normalizeShiprocketStatus(statusRaw);
+  const estimatedDelivery = extractShiprocketEDD(payload);
+  const events = extractShiprocketEvents(payload);
+
+  return { status, estimatedDelivery, events, raw: payload };
+}
 
 
 
@@ -50,6 +225,78 @@ function formatMoney(amount, currency = "INR") {
   const num = Number(amount || 0);
   if (Number.isNaN(num)) return `${currency} 0.00`;
   return `${currency} ${num.toFixed(2)}`;
+}
+
+function toProductGid(productIdOrGid) {
+  const raw = decodeURIComponent(String(productIdOrGid || "")).trim();
+  if (!raw) return null;
+
+  if (raw.startsWith("gid://shopify/Product/")) return raw;
+  if (/^\d+$/.test(raw)) return `gid://shopify/Product/${raw}`;
+
+  if (raw.startsWith("gid://")) {
+    return raw.includes("gid://shopify/Product/") ? raw : null;
+  }
+
+  return null;
+}
+
+async function hasPurchasedProduct({ email, productGid }) {
+  if (!email || !productGid) return false;
+  if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return false;
+
+  const url = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`;
+
+  const response = await axios.post(
+      url,
+      {
+        query: `
+          query OrdersByEmail($query: String!) {
+            orders(first: 25, query: $query, sortKey: CREATED_AT, reverse: true) {
+              edges {
+                node {
+                  id
+                  lineItems(first: 100) {
+                    edges {
+                      node {
+                        product { id }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        `,
+        variables: { query: `email:${email}` },
+      },
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+      }
+    );
+
+  const data = response.data;
+  if (data?.errors?.length) return false;
+
+  const orders = data?.data?.orders?.edges || [];
+  for (const edge of orders) {
+    const lineItems = edge?.node?.lineItems?.edges || [];
+    for (const li of lineItems) {
+      const id = li?.node?.product?.id;
+      if (id && String(id) === String(productGid)) return true;
+    }
+  }
+
+  return false;
+}
+
+function requirePurchasedReview() {
+  const raw = String(process.env.REQUIRE_PURCHASED_REVIEW ?? "true").trim().toLowerCase();
+  return !(raw === "false" || raw === "0" || raw === "no" || raw === "off");
 }
 
 async function fetchOrderForInvoice(orderGid) {
@@ -122,6 +369,103 @@ async function fetchOrderForInvoice(orderGid) {
   }
 
   return data?.data?.order || null;
+}
+
+async function fetchOrderForTracking(orderGid) {
+  const url = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`;
+
+  const response = await axios.post(
+    url,
+    {
+      query: `
+        query OrderForTracking($id: ID!) {
+          order(id: $id) {
+            id
+            name
+            createdAt
+            processedAt
+            displayFinancialStatus
+            displayFulfillmentStatus
+            fulfillments {
+              status
+              createdAt
+              trackingInfo {
+                number
+                url
+                company
+              }
+            }
+          }
+        }
+      `,
+      variables: { id: orderGid },
+    },
+    {
+      headers: {
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+      timeout: 10000,
+    }
+  );
+
+  const data = response.data;
+  if (data?.errors?.length) {
+    const msg = data.errors[0]?.message || "Shopify GraphQL error";
+    const err = new Error(msg);
+    err.shopifyErrors = data.errors;
+    throw err;
+  }
+
+  return data?.data?.order || null;
+}
+
+function buildOrderTrackingTimeline(order) {
+  const createdAt = order?.createdAt || null;
+  const processedAt = order?.processedAt || null;
+  const fulfillmentStatus = String(order?.displayFulfillmentStatus || "").toUpperCase();
+
+  const fulfillments = Array.isArray(order?.fulfillments) ? order.fulfillments : [];
+  const hasFulfillment = fulfillments.length > 0;
+
+  const delivered = fulfillmentStatus === "FULFILLED";
+  const shipped =
+    delivered ||
+    fulfillmentStatus === "IN_PROGRESS" ||
+    fulfillmentStatus === "PARTIALLY_FULFILLED" ||
+    hasFulfillment;
+
+  // Shopify does not expose "Out for delivery" in Admin API without integrating a shipping provider.
+  // We mark it true only when shipped + tracking exists (best-effort), otherwise false.
+  const firstTracking = (() => {
+    for (const f of fulfillments) {
+      const infos = Array.isArray(f?.trackingInfo) ? f.trackingInfo : [];
+      const t = infos.find((x) => x?.number || x?.url || x?.company);
+      if (t) return t;
+    }
+    return null;
+  })();
+
+  const outForDelivery = Boolean(shipped && !delivered && firstTracking);
+
+  return {
+    createdAt,
+    processedAt,
+    confirmedAt: hasFulfillment ? (fulfillments[0]?.createdAt || processedAt || createdAt) : (processedAt || createdAt),
+    steps: [
+      { key: "placed", label: "Order placed", completed: Boolean(createdAt), timestamp: createdAt },
+      { key: "confirmed", label: "Confirmed", completed: Boolean(hasFulfillment), timestamp: hasFulfillment ? (fulfillments[0]?.createdAt || processedAt || createdAt) : null },
+      { key: "shipped", label: "Shipped", completed: Boolean(shipped), timestamp: shipped ? (fulfillments[0]?.createdAt || processedAt || createdAt) : null },
+      { key: "out_for_delivery", label: "Out for delivery", completed: Boolean(outForDelivery), timestamp: null },
+      { key: "delivered", label: "Delivered", completed: Boolean(delivered), timestamp: null },
+    ],
+    tracking: firstTracking
+      ? {
+          number: firstTracking.number || null,
+          url: firstTracking.url || null,
+          company: firstTracking.company || null,
+        }
+      : null,
+  };
 }
 
 function buildInvoicePdfBuffer(order) {
@@ -816,8 +1160,21 @@ app.get("/api/shopify/coupons", async (req, res) => {
     const rules = priceRulesResponse.data.price_rules || [];
 
     let coupons = [];
+    const now = new Date();
 
     for (const rule of rules) {
+      const startsAt = rule.starts_at ? new Date(rule.starts_at) : null;
+      const endsAt = rule.ends_at ? new Date(rule.ends_at) : null;
+      const is_expired = endsAt ? endsAt < now : false;
+      const is_started = startsAt ? startsAt <= now : true;
+
+      const discountType = rule.value_type;
+      if (discountType !== "fixed_amount" && discountType !== "percentage") {
+        continue; // only support percentage & fixed_amount
+      }
+
+      const valueNumber = Math.abs(Number.parseFloat(rule.value));
+      if (!Number.isFinite(valueNumber) || valueNumber <= 0) continue;
 
       const codesResponse = await axios.get(
         `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules/${rule.id}/discount_codes.json`,
@@ -837,15 +1194,17 @@ app.get("/api/shopify/coupons", async (req, res) => {
   title: rule.title,
   code: code.code,
 
-  discount_type: rule.value_type || "buy_x_get_y",
+  discount_type: discountType,
 
-  value: rule.value,
+  value: valueNumber,
 
   minimum:
     rule.prerequisite_subtotal_range?.greater_than_or_equal_to || null,
 
-  starts_at: rule.starts_at,
-  ends_at: rule.ends_at,
+  starts_at: rule.starts_at || null,
+  ends_at: rule.ends_at || null,
+  is_expired,
+  is_started,
 
   buy_quantity: rule.prerequisite_quantity_range?.greater_than_or_equal_to || null,
 
@@ -863,6 +1222,107 @@ app.get("/api/shopify/coupons", async (req, res) => {
 
     res.status(500).json([]);
 
+  }
+});
+
+/* ------------------ PRODUCT REVIEWS ------------------ */
+
+app.get("/api/review/:productId", async (req, res) => {
+  try {
+    const productId = decodeURIComponent(String(req.params.productId || "")).trim();
+
+    if (!productId) return res.json([]);
+
+    const reviews = await Review.find({ productId })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+
+    res.json(
+      reviews.map((r) => ({
+        productId: r.productId,
+        rating: r.rating,
+        body: r.body,
+        reviewer: r.reviewer,
+        timestamp: r.createdAt,
+      }))
+    );
+  } catch (err) {
+    console.error("Reviews Fetch Error:", err.message);
+    res.status(500).json([]);
+  }
+});
+
+app.post("/api/review", async (req, res) => {
+  try {
+    const { productId, rating, body, reviewer } = req.body || {};
+
+    const normalizedProductId = String(productId || "").trim();
+    const normalizedRating = Number(rating);
+    const normalizedBody = String(body || "").trim();
+
+    const reviewerName = String(reviewer?.name || "").trim();
+    const reviewerEmail = String(reviewer?.email || "").trim().toLowerCase();
+
+    if (!normalizedProductId) {
+      return res.status(400).json({ error: "productId is required" });
+    }
+    if (!Number.isFinite(normalizedRating) || normalizedRating < 1 || normalizedRating > 5) {
+      return res.status(400).json({ error: "rating must be between 1 and 5" });
+    }
+    if (!normalizedBody) {
+      return res.status(400).json({ error: "review text is required" });
+    }
+    if (!reviewerName || !reviewerEmail) {
+      return res.status(400).json({ error: "reviewer name and email are required" });
+    }
+
+    // Optional (preferred): restrict reviews to purchased users.
+    if (requirePurchasedReview()) {
+      const productGid = toProductGid(normalizedProductId);
+      if (productGid) {
+        if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) {
+          return res.status(500).json({ error: "Shopify credentials not configured for purchase validation" });
+        }
+
+        try {
+          const purchased = await hasPurchasedProduct({ email: reviewerEmail, productGid });
+          if (!purchased) {
+            return res.status(403).json({ error: "Only purchased users can review this product" });
+          }
+        } catch (e) {
+          const status = e?.response?.status;
+          if (status === 401 || status === 403) {
+            return res.status(502).json({ error: "Shopify Admin token is invalid for purchase validation" });
+          }
+          return res.status(502).json({ error: "Purchase validation failed" });
+        }
+      }
+    }
+
+    const saved = await Review.create({
+      productId: normalizedProductId,
+      rating: normalizedRating,
+      body: normalizedBody,
+      reviewer: {
+        name: reviewerName,
+        email: reviewerEmail,
+      },
+    });
+
+    res.json({
+      success: true,
+      review: {
+        productId: saved.productId,
+        rating: saved.rating,
+        body: saved.body,
+        reviewer: saved.reviewer,
+        timestamp: saved.createdAt,
+      },
+    });
+  } catch (err) {
+    console.error("Review Create Error:", err.response?.data || err.message);
+    res.status(500).json({ error: "Failed to submit review" });
   }
 });
 
@@ -890,11 +1350,165 @@ app.get("/api/order/:id/invoice", async (req, res) => {
 
     const safeName = String(order?.name || "order").replace(/[^a-zA-Z0-9-_]/g, "");
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `inline; filename="invoice-${safeName || "order"}.pdf"`);
+    res.setHeader("Content-Disposition", `attachment; filename="invoice-${safeName || "order"}.pdf"`);
     return res.status(200).send(pdfBuffer);
   } catch (err) {
     console.error("Invoice Error:", err.response?.data || err.message);
     return res.status(500).json({ error: "Invoice generation failed" });
+  }
+});
+
+/* ------------------ ORDER TRACKING ------------------ */
+
+app.get("/api/order/:id/tracking", async (req, res) => {
+  try {
+    const orderGid = toOrderGid(req.params.id);
+
+    if (!orderGid) {
+      return res.status(400).json({ error: "Invalid order id" });
+    }
+
+    if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) {
+      return res.status(500).json({ error: "Shopify env vars not configured" });
+    }
+
+    const order = await fetchOrderForTracking(orderGid);
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const shopifyTimeline = buildOrderTrackingTimeline(order);
+
+    const trackingNumber = shopifyTimeline?.tracking?.number || null;
+    const courier = shopifyTimeline?.tracking?.company || null;
+    const liveTrackingUrl = shopifyTimeline?.tracking?.url || null;
+
+    let shiprocketAvailable = false;
+    let currentStatus = "";
+    let estimatedDelivery = null;
+    let trackingEvents = [];
+
+    if (trackingNumber) {
+      try {
+        const shiprocket = await fetchShiprocketTrackingByAwb(trackingNumber);
+        shiprocketAvailable = true;
+        currentStatus = shiprocket.status || "";
+        estimatedDelivery = shiprocket.estimatedDelivery || null;
+        trackingEvents = shiprocket.events || [];
+      } catch (e) {
+        shiprocketAvailable = false;
+        console.error("Shiprocket Tracking Error:", e?.response?.data || e.message);
+      }
+    }
+
+    if (!currentStatus) {
+      const s = String(order?.displayFulfillmentStatus || "").toUpperCase();
+      if (s === "FULFILLED") currentStatus = "Delivered";
+      else if (s === "IN_PROGRESS" || s === "PARTIALLY_FULFILLED") currentStatus = "In Transit";
+      else if (shopifyTimeline?.steps?.find((x) => x?.key === "confirmed")?.completed) currentStatus = "Confirmed";
+      else currentStatus = "Order Placed";
+    }
+
+    const fulfillments = Array.isArray(order?.fulfillments) ? order.fulfillments : [];
+    const hasFulfillment = fulfillments.length > 0;
+
+    const placedTime = toIsoDate(order?.createdAt) || null;
+    const firstFulfillmentCreatedAt = (() => {
+      const dates = fulfillments
+        .map((f) => toIsoDate(f?.createdAt))
+        .filter(Boolean)
+        .sort();
+      return dates.length ? dates[0] : null;
+    })();
+
+    // Confirmed: fulfillment exists in Shopify.
+    const confirmedDone = hasFulfillment;
+    const confirmedTime = firstFulfillmentCreatedAt;
+
+    const cleanStatus = normalizeShiprocketStatus(currentStatus);
+
+    const shiprocketShippedStatuses = new Set([
+      "Picked Up",
+      "In Transit",
+      "Out for Delivery",
+      "Delivered",
+    ]);
+
+    const shippedDone = shiprocketAvailable
+      ? shiprocketShippedStatuses.has(cleanStatus)
+      : (shopifyTimeline?.steps?.find((x) => x?.key === "shipped")?.completed === true);
+
+    const outForDeliveryDone = shiprocketAvailable
+      ? (cleanStatus === "Out for Delivery" || cleanStatus === "Delivered")
+      : false;
+
+    const deliveredDone = shiprocketAvailable
+      ? (cleanStatus === "Delivered")
+      : (shopifyTimeline?.steps?.find((x) => x?.key === "delivered")?.completed === true);
+
+    const sortedEvents = (trackingEvents || [])
+      .filter((e) => e?.time)
+      .slice()
+      .sort((a, b) => String(a.time).localeCompare(String(b.time)));
+
+    const statusFromEvent = (desc) => {
+      const s = String(desc || "").trim();
+      if (!s) return "";
+      const token = s.split(/\s+/)[0].toUpperCase();
+      if (["DLVD", "OFD", "PKD", "IT", "RTO", "CANC"].includes(token)) {
+        return normalizeShiprocketStatus(token);
+      }
+      if (["DLVD", "OFD", "PKD", "IT", "RTO", "CANC"].includes(s.toUpperCase())) {
+        return normalizeShiprocketStatus(s.toUpperCase());
+      }
+      return normalizeShiprocketStatus(s);
+    };
+
+    const firstEventTimeForStatuses = (statuses) => {
+      for (const e of sortedEvents) {
+        const ev = statusFromEvent(e?.description);
+        if (statuses.has(ev)) return e.time || null;
+      }
+      return null;
+    };
+
+    const shippedTime = shippedDone
+      ? (firstEventTimeForStatuses(shiprocketShippedStatuses) || confirmedTime || placedTime)
+      : null;
+
+    const outForDeliveryTime = outForDeliveryDone
+      ? (firstEventTimeForStatuses(new Set(["Out for Delivery"])) || null)
+      : null;
+
+    const deliveredTime = deliveredDone
+      ? (sortedEvents.length ? (sortedEvents[sortedEvents.length - 1].time || null) : null)
+      : null;
+
+    return res.json({
+      orderId: order.id,
+      trackingNumber,
+      courier,
+      currentStatus,
+      estimatedDelivery,
+      timeline: [
+        { step: "Order Placed", done: true, time: placedTime },
+        { step: "Confirmed", done: Boolean(confirmedDone), time: confirmedTime },
+        { step: "Shipped", done: Boolean(shippedDone), time: shippedTime },
+        { step: "Out for Delivery", done: Boolean(outForDeliveryDone), time: outForDeliveryTime },
+        { step: "Delivered", done: Boolean(deliveredDone), time: deliveredTime },
+      ],
+      trackingEvents,
+      liveTrackingUrl,
+      shiprocket_available: shiprocketAvailable,
+    });
+  } catch (err) {
+    console.error("Order Tracking Error:", err.response?.data || err.message);
+    const status = err?.response?.status;
+    if (status === 401 || status === 403) {
+      return res.status(502).json({ error: "Shopify Admin token is invalid" });
+    }
+    return res.status(500).json({ error: "Failed to fetch tracking" });
   }
 });
 
