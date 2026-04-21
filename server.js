@@ -7,6 +7,7 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
+const fs = require("fs");
 const axios = require("axios");
 
 const app = express();
@@ -25,6 +26,31 @@ const razorpay = new Razorpay({
 });
 
 const SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket_jwt";
+
+function toNumericId(gid) {
+  if (!gid) return null;
+  if (typeof gid === 'number') return gid;
+  const str = gid.toString();
+  if (str.includes('gid://')) {
+    return parseInt(str.split('/').pop());
+  }
+  return parseInt(str);
+}
+
+async function getShopifyCustomerIdByEmail(email) {
+  if (!email) return null;
+  const query = encodeURIComponent(`email:${String(email).trim()}`);
+  const response = await axios.get(
+    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+    {
+      headers: {
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+    }
+  );
+  const customerId = response?.data?.customers?.[0]?.id;
+  return customerId || null;
+}
 
 async function getShiprocketToken() {
   const cached = cache.get(SHIPROCKET_TOKEN_CACHE_KEY);
@@ -85,6 +111,34 @@ function normalizeShiprocketStatus(raw) {
       if (code === "PICKED UP" || code === "PICKED_UP") return "Picked Up";
       return s;
   }
+}
+
+function getDisplayStatus(order) {
+  const financial = String(
+    order?.financial_status || order?.financialStatus || order?.displayFinancialStatus || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const fulfillment = String(
+    order?.fulfillment_status || order?.fulfillmentStatus || order?.displayFulfillmentStatus || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const cancelReason = order?.cancel_reason || order?.cancelReason || null;
+  const cancelledAt = order?.cancelled_at || order?.cancelledAt || null;
+
+  // Priority order — check top to bottom:
+  if (cancelReason || cancelledAt) return "Cancelled";
+  if (financial === "voided") return "Cancelled";
+  if (financial === "refunded") return "Refunded";
+  if (financial === "partially_refunded") return "Partially Refunded";
+  if (fulfillment === "fulfilled") return "Delivered";
+  if (fulfillment === "partial") return "Partially Shipped";
+  if (financial === "paid" || financial === "partially_paid") return "Confirmed";
+  if (financial === "pending") return "Pending Payment";
+  return "Processing";
 }
 
 function toIsoDate(value) {
@@ -227,6 +281,16 @@ function formatMoney(amount, currency = "INR") {
   return `${currency} ${num.toFixed(2)}`;
 }
 
+function calculateShipping(cartSubtotal, isCod = false) {
+  const amount = Number(cartSubtotal || 0);
+  if (amount >= 1500) {
+    return { title: "Free Shipping", price: "0.00", code: "FREE" };
+  }
+  return isCod
+    ? { title: "COD Shipping",      price: "120.00", code: "COD" }
+    : { title: "Standard Shipping", price: "80.00",  code: "FLAT" };
+}
+
 function toProductGid(productIdOrGid) {
   const raw = decodeURIComponent(String(productIdOrGid || "")).trim();
   if (!raw) return null;
@@ -300,75 +364,198 @@ function requirePurchasedReview() {
 }
 
 async function fetchOrderForInvoice(orderGid) {
-  const url = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`;
+  const numericId = String(orderGid)
+    .replace("gid://shopify/Order/", "")
+    .split("?")[0]
+    .trim();
 
-  const response = await axios.post(
-    url,
-    {
-      query: `
-        query OrderForInvoice($id: ID!) {
-          order(id: $id) {
-            id
-            name
-            createdAt
-            processedAt
-            displayFinancialStatus
-            displayFulfillmentStatus
-
-            customer {
-              firstName
-              lastName
-              email
-              phone
-            }
-
-            shippingAddress {
-              name
-              address1
-              address2
-              city
-              province
-              country
-              zip
-              phone
-            }
-
-            subtotalPriceSet { shopMoney { amount currencyCode } }
-            totalShippingPriceSet { shopMoney { amount currencyCode } }
-            currentTotalPriceSet { shopMoney { amount currencyCode } }
-            totalTaxSet { shopMoney { amount currencyCode } }
-
-            lineItems(first: 50) {
-              edges {
-                node {
-                  title
-                  quantity
-                  variantTitle
-                  originalUnitPriceSet { shopMoney { amount currencyCode } }
-                }
-              }
-            }
-          }
-        }
-      `,
-      variables: { id: orderGid },
-    },
+  const response = await axios.get(
+    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders/${numericId}.json`,
     {
       headers: {
         "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
       },
+      timeout: 10000,
     }
   );
 
-  const data = response.data;
-  if (data?.errors?.length) {
-    const msg = data.errors[0]?.message || "Shopify GraphQL error";
-    const err = new Error(msg);
-    err.shopifyErrors = data.errors;
-    throw err;
-  }
+  const order = response?.data?.order;
+  if (!order) return null;
 
-  return data?.data?.order || null;
+  const noteAttrs = {};
+  (order.note_attributes || []).forEach((attr) => {
+    if (!attr?.name) return;
+    noteAttrs[attr.name] = attr.value;
+  });
+
+  const nameFromParts = (obj) => {
+    const first = String(obj?.first_name || "").trim();
+    const last = String(obj?.last_name || "").trim();
+    const combined = [first, last].filter(Boolean).join(" ").trim();
+    return combined;
+  };
+
+  const customerName =
+    nameFromParts(order.customer) ||
+    nameFromParts(order.billing_address) ||
+    nameFromParts(order.shipping_address) ||
+    "Customer";
+
+  const customerEmail =
+    order.email ||
+    order.contact_email ||
+    order.customer?.email ||
+    "";
+
+  const customerPhone =
+    noteAttrs["Customer Phone"] ||
+    order.billing_address?.phone ||
+    order.shipping_address?.phone ||
+    order.customer?.phone ||
+    "";
+
+  const billingName = nameFromParts(order.billing_address);
+  const shippingName = nameFromParts(order.shipping_address);
+
+  const billingAddress = {
+    name: billingName,
+    address1: order.billing_address?.address1 || "",
+    address2: order.billing_address?.address2 || "",
+    city: order.billing_address?.city || "",
+    province: order.billing_address?.province || "",
+    country: order.billing_address?.country || "",
+    zip: order.billing_address?.zip || "",
+    phone: order.billing_address?.phone || customerPhone,
+  };
+
+  const shippingAddress = {
+    name: shippingName,
+    address1: order.shipping_address?.address1 || "",
+    address2: order.shipping_address?.address2 || "",
+    city: order.shipping_address?.city || "",
+    province: order.shipping_address?.province || "",
+    country: order.shipping_address?.country || "",
+    zip: order.shipping_address?.zip || "",
+    phone: customerPhone,
+  };
+
+  const currency = order.currency || "INR";
+
+  const shippingAmount =
+    order.total_shipping_price_set?.shop_money?.amount ||
+    order.shipping_lines?.[0]?.price ||
+    "0";
+
+  const discountCodes = Array.isArray(order.discount_codes) ? order.discount_codes : [];
+  const appliedCouponsFromCodes = discountCodes
+    .map((d) => String(d?.code || "").trim())
+    .filter(Boolean)
+    .join(", ");
+
+  const couponDiscountFromCodes = discountCodes.reduce((sum, d) => {
+    const a = Number(d?.amount || 0);
+    return sum + (Number.isFinite(a) ? a : 0);
+  }, 0);
+
+  const couponDiscountFromNote = Number(noteAttrs["Coupon Discount"] || 0);
+  const couponCodeFromNote = String(noteAttrs["Coupon Code"] || "").trim();
+  const appliedCoupons = appliedCouponsFromCodes || couponCodeFromNote || "";
+  const couponDiscountAmount = (couponDiscountFromCodes > 0
+    ? couponDiscountFromCodes
+    : (Number.isFinite(couponDiscountFromNote) ? couponDiscountFromNote : 0)
+  ).toFixed(2);
+
+  const shippingAmountFromNote = String(noteAttrs["Shipping Amount"] || "").trim();
+  const shopifyShip = String(shippingAmount || "").trim();
+  const noteShip = String(shippingAmountFromNote || "").trim();
+  const finalShippingAmount = (
+    Number(shopifyShip || 0) === 0 && Number(noteShip || 0) > 0
+      ? noteShip
+      : (shopifyShip || noteShip || "0")
+  );
+
+  const totalMrpFromNoteRaw = String(noteAttrs["Total MRP"] || "").trim();
+  const subtotalForInvoice = totalMrpFromNoteRaw ? totalMrpFromNoteRaw : (order.subtotal_price || "0");
+
+  const finalPayableFromNoteRaw = String(noteAttrs["Final Payable"] || "").trim();
+  const totalForInvoice = finalPayableFromNoteRaw
+    ? finalPayableFromNoteRaw
+    : (order.current_total_price || order.total_price || "0");
+
+  const subtotalNum = Number(subtotalForInvoice || 0);
+  const currentTotalNum = Number(totalForInvoice || 0);
+  const shippingNum = Number(finalShippingAmount || 0);
+  const couponDiscNum = Number(couponDiscountAmount || 0);
+  const productDiscountAmount = Math.max(
+    0,
+    subtotalNum - currentTotalNum + shippingNum - couponDiscNum
+  ).toFixed(2);
+
+  return {
+    id: order.admin_graphql_api_id || `gid://shopify/Order/${numericId}`,
+    name: order.name || "-",
+    createdAt: order.created_at || null,
+    processedAt: order.processed_at || order.created_at || null,
+    displayFinancialStatus: (order.financial_status || "pending").toUpperCase(),
+    displayFulfillmentStatus: (order.fulfillment_status || "unfulfilled").toUpperCase(),
+    displayStatus: getDisplayStatus(order),
+
+    customerName,
+    customerEmail,
+    customerPhone,
+
+    billingAddress,
+    shippingAddress,
+
+    subtotalPriceSet: {
+      shopMoney: {
+        amount: subtotalForInvoice,
+        currencyCode: currency,
+      },
+    },
+    totalShippingPriceSet: {
+      shopMoney: {
+        amount: finalShippingAmount,
+        currencyCode: currency,
+      },
+    },
+    currentTotalPriceSet: {
+      shopMoney: {
+        amount: totalForInvoice,
+        currencyCode: currency,
+      },
+    },
+    totalTaxSet: {
+      shopMoney: {
+        amount: order.total_tax || "0",
+        currencyCode: currency,
+      },
+    },
+    lineItems: {
+      edges: (order.line_items || []).map((item) => ({
+        node: {
+          title: item.title || "Item",
+          quantity: item.quantity || 1,
+          variantTitle: item.variant_title || "",
+          originalUnitPriceSet: {
+            shopMoney: {
+              amount: item.price || "0",
+              currencyCode: currency,
+            },
+          },
+        },
+      })),
+    },
+    shippingCharge: finalShippingAmount,
+    shippingTitle: order.shipping_lines?.[0]?.title || "Shipping",
+    isFreeShipping: Number(finalShippingAmount) === 0,
+    shippingAmount: finalShippingAmount,
+    couponDiscountAmount,
+    appliedCoupons,
+    couponCode: appliedCoupons || null,
+    couponDiscount: couponDiscountAmount,
+    productDiscount: productDiscountAmount,
+  };
 }
 
 async function fetchOrderForTracking(orderGid) {
@@ -386,6 +573,8 @@ async function fetchOrderForTracking(orderGid) {
             processedAt
             displayFinancialStatus
             displayFulfillmentStatus
+            cancelReason
+            cancelledAt
             fulfillments {
               status
               createdAt
@@ -469,22 +658,35 @@ function buildOrderTrackingTimeline(order) {
 }
 
 function buildInvoicePdfBuffer(order) {
-  const doc = new PDFDocument({ size: "A4", margin: 40 });
-
+  const doc = new PDFDocument({ size: "A4", margin: 0 });
   const chunks = [];
   doc.on("data", (c) => chunks.push(c));
-
   const done = new Promise((resolve, reject) => {
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
   });
 
-  const name = order?.name || "Order";
-  const processedAt = order?.processedAt || order?.createdAt || null;
-  const dateStr = processedAt ? new Date(processedAt).toISOString().slice(0, 10) : "";
+  const brandColor = "#EA0180";
+  const darkColor  = "#1a1a2e";
+  const grayColor  = "#6c757d";
+  const lightGray  = "#f8f9fa";
+  const borderColor = "#dee2e6";
+  const M = 36;
+  const pageW = doc.page.width;   // 595
+  const pageH = doc.page.height;  // 842
+  const cW = pageW - M * 2;       // 523
 
-  const ship = order?.shippingAddress || {};
-  const customer = order?.customer || {};
+  const orderName = (() => {
+    const r = String(order?.name || "").trim();
+    if (!r || r.includes("gid://")) return "-";
+    return r.startsWith("#") ? r : `#${r}`;
+  })();
+
+  const dateStr = (() => {
+    const d = new Date(order?.processedAt || order?.createdAt || "");
+    if (isNaN(d)) return "-";
+    return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  })();
 
   const currency =
     order?.currentTotalPriceSet?.shopMoney?.currencyCode ||
@@ -492,112 +694,270 @@ function buildInvoicePdfBuffer(order) {
     "INR";
 
   const subtotal = Number(order?.subtotalPriceSet?.shopMoney?.amount || 0);
-  const shipping = Number(order?.totalShippingPriceSet?.shopMoney?.amount || 0);
-  const tax = Number(order?.totalTaxSet?.shopMoney?.amount || 0);
-  const total = Number(order?.currentTotalPriceSet?.shopMoney?.amount || 0);
-  const discount = Math.max(0, subtotal + shipping + tax - total);
+  const shipAmt  = Number(order?.shippingAmount || order?.totalShippingPriceSet?.shopMoney?.amount || 0);
+  const tax      = Number(order?.totalTaxSet?.shopMoney?.amount || 0);
+  const total    = Number(order?.currentTotalPriceSet?.shopMoney?.amount || 0);
+  const couponDisc = Number(order?.couponDiscountAmount || 0);
+  const productDisc = Math.max(
+    0,
+    subtotal - total + shipAmt - couponDisc
+  );
 
-  doc.fontSize(22).text("Invoice", { continued: false });
-  doc.moveDown(0.3);
+  const ba = order?.billingAddress || {};
+  const sa = order?.shippingAddress || {};
 
-  doc.fontSize(11).fillColor("#444444");
-  doc.text(`Order: ${name}`);
-  if (dateStr) doc.text(`Date: ${dateStr}`);
-  doc.text(`Payment: ${order?.displayFinancialStatus || "-"}`);
-  doc.text(`Fulfillment: ${order?.displayFulfillmentStatus || "-"}`);
+  const customerName = String(order?.customerName || "").trim();
+  const customerEmail = String(order?.customerEmail || "").trim();
+  const customerPhone = String(order?.customerPhone || "").trim();
 
-  doc.moveDown(0.8);
-  doc.fillColor("#000000");
-  doc.fontSize(12).text("Customer Details", { underline: true });
-  doc.moveDown(0.2);
-  const custName = [customer.firstName, customer.lastName].filter(Boolean).join(" ").trim();
-  doc.fontSize(10);
-  doc.text(custName || ship.name || "-");
-  if (customer.email) doc.text(customer.email);
-  if (customer.phone || ship.phone) doc.text(customer.phone || ship.phone);
+  const safeCustomerName =
+    customerName && customerName.trim() && customerName.trim().toLowerCase() !== "customer"
+      ? customerName.trim()
+      : "";
 
-  doc.moveDown(0.8);
-  doc.fontSize(12).text("Shipping Address", { underline: true });
-  doc.moveDown(0.2);
-  doc.fontSize(10);
-  const addrLines = [
-    ship.name,
-    ship.address1,
-    ship.address2,
-    [ship.city, ship.province, ship.zip].filter(Boolean).join(", "),
-    ship.country,
-    ship.phone ? `Phone: ${ship.phone}` : null,
-  ].filter((l) => l && String(l).trim().length > 0);
-  if (addrLines.length === 0) {
-    doc.text("-");
-  } else {
-    addrLines.forEach((l) => doc.text(l));
+  const billCityProvince = [ba.city, ba.province].filter(Boolean).join(", ");
+  const billZipCountry = [ba.zip, ba.country].filter(Boolean).join(", ");
+
+  const shipCityProvince = [sa.city, sa.province].filter(Boolean).join(", ");
+  const shipZipCountry = [sa.zip, sa.country].filter(Boolean).join(", ");
+
+  const billLines = [
+    { text: ba.name || safeCustomerName || null, bold: true },
+    { text: customerEmail || null, bold: false },
+    { text: ba.address1 || null, bold: false },
+    { text: ba.address2 || null, bold: false },
+    { text: billCityProvince || null, bold: false },
+    { text: billZipCountry || null, bold: false },
+    { text: ba.phone || customerPhone || null, bold: false },
+  ].filter((l) => l.text && String(l.text).trim().length > 0);
+  if (!billLines.length) billLines.push({ text: "-", bold: false });
+
+  const shipLines = [
+    { text: sa.name || safeCustomerName || null, bold: true },
+    { text: sa.address1 || null, bold: false },
+    { text: sa.address2 || null, bold: false },
+    { text: shipCityProvince || null, bold: false },
+    { text: shipZipCountry || null, bold: false },
+    { text: sa.phone || customerPhone || null, bold: false },
+  ].filter((l) => l.text && String(l.text).trim().length > 0);
+  if (!shipLines.length) shipLines.push({ text: "-", bold: false });
+
+  function text1Line(text, x, y, opts) {
+    doc.text(String(text || ""), x, y, { ...(opts || {}), lineBreak: false, ellipsis: true });
   }
 
-  doc.moveDown(1.0);
-  doc.fontSize(12).text("Items", { underline: true });
-  doc.moveDown(0.5);
+  // ── HEADER (0–56) — compact ──
+  doc.rect(0, 0, pageW, 56).fill(brandColor);
 
-  const tableTop = doc.y;
-  const colTitleX = 40;
-  const colQtyX = 340;
-  const colUnitX = 390;
-  const colTotalX = 470;
+  const logoCandidates = [
+    path.join(__dirname, "assets", "logo.png"),
+    path.join(__dirname, "assets", "Logo.png"),
+    path.join(__dirname, "assets", "logo.jpg"),
+    path.join(__dirname, "src", "assets", "logo.png"),
+    path.join(__dirname, "images", "logo.png"),
+    path.join(__dirname, "public", "logo.png"),
+    path.join(__dirname, "public", "images", "logo.png"),
+  ];
 
-  doc.fontSize(10).fillColor("#000000");
-  doc.text("Item", colTitleX, tableTop);
-  doc.text("Qty", colQtyX, tableTop, { width: 40, align: "right" });
-  doc.text("Unit", colUnitX, tableTop, { width: 70, align: "right" });
-  doc.text("Total", colTotalX, tableTop, { width: 80, align: "right" });
+  const logoPath = logoCandidates.find((p) => fs.existsSync(p)) || null;
 
-  doc.moveTo(40, tableTop + 14).lineTo(555, tableTop + 14).strokeColor("#dddddd").stroke();
+  if (logoPath) {
+    // No white circle — just render logo directly, fitted to height
+    doc.roundedRect(M, 8, 120, 40, 4).fill("#ffffff");
+    doc.image(logoPath, M + 2, 9, { height: 38, fit: [116, 38] });
+  } else {
+    doc.circle(M + 16, 28, 14).fill("#ffffff");
+    doc.fillColor("#EA0180").font("Helvetica-Bold").fontSize(14)
+      .text("M", M + 9, 22, { width: 14, align: "center" });
+  }
 
-  let y = tableTop + 22;
-  const edges = order?.lineItems?.edges || [];
+  // Brand name starts after logo — push right enough
+  const textStartX = M + 130;
+  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(13)
+    .text("Makeup Mystery India", textStartX, 16);
+  doc.fillColor("rgba(255,255,255,0.80)").font("Helvetica").fontSize(7.5)
+    .text("Premium Beauty & Cosmetics  \u00B7  makeupmysteryindia.in", textStartX, 32);
 
-  edges.forEach((edge) => {
-    const node = edge?.node || {};
-    const qty = Number(node.quantity || 0);
-    const unit = Number(node?.originalUnitPriceSet?.shopMoney?.amount || 0);
-    const lineTotal = unit * qty;
+  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(22)
+    .text("INVOICE", 0, 17, { width: pageW - M, align: "right" });
 
-    doc.fontSize(10).fillColor("#000000");
-    doc.text(String(node.title || "Item"), colTitleX, y, { width: 285 });
-    doc.text(String(qty || 0), colQtyX, y, { width: 40, align: "right" });
-    doc.text(formatMoney(unit, currency), colUnitX, y, { width: 70, align: "right" });
-    doc.text(formatMoney(lineTotal, currency), colTotalX, y, { width: 80, align: "right" });
+  // ── META ROW (64–108) ──
+  const metaY = 64;
+  doc.fillColor(darkColor).font("Helvetica-Bold").fontSize(7.5).text("INVOICE NUMBER", M, metaY);
+  doc.fillColor(brandColor).font("Helvetica-Bold").fontSize(11).text(orderName, M, metaY + 11);
+  doc.fillColor(grayColor).font("Helvetica").fontSize(7.5).text("Invoice Date", M, metaY + 27);
+  doc.fillColor(darkColor).font("Helvetica").fontSize(8.5).text(dateStr, M, metaY + 38);
 
-    y += 18;
-    if (y > 720) {
-      doc.addPage();
-      y = 60;
-    }
+  const statusTxt = String(order?.displayFinancialStatus || "PAID").toUpperCase();
+  const badgeClr = statusTxt === "PAID" ? "#28a745" : "#ffc107";
+  const bX = pageW - M - 80;
+  doc.roundedRect(bX, metaY, 80, 20, 3).fill(badgeClr);
+  doc.fillColor("#fff").font("Helvetica-Bold").fontSize(9)
+    .text(statusTxt, bX, metaY + 6, { width: 80, align: "center" });
+  doc.fillColor(grayColor).font("Helvetica").fontSize(7.5)
+    .text(String(order?.displayFulfillmentStatus || "UNFULFILLED"), bX, metaY + 28, { width: 80, align: "center" });
+
+  // ── DIVIDER ──
+  doc.strokeColor(borderColor).lineWidth(0.5).moveTo(M, 112).lineTo(pageW - M, 112).stroke();
+
+  // ── BILL / SHIP BOXES (118–...) ──
+  const boxY = 118;
+  const lineH = 11;
+
+  const isSameAddress =
+    (ba.address1 || "") === (sa.address1 || "") &&
+    (ba.city || "") === (sa.city || "") &&
+    (ba.zip || "") === (sa.zip || "");
+
+  const renderAddressLines = (lines, x, yStart, width) => {
+    let y = yStart;
+    lines.forEach((l) => {
+      const isBold = Boolean(l.bold);
+      doc
+        .fillColor(isBold ? darkColor : grayColor)
+        .font(isBold ? "Helvetica-Bold" : "Helvetica")
+        .fontSize(isBold ? 8.5 : 7.5);
+      text1Line(l.text, x, y, { width });
+      y += isBold ? 13 : lineH;
+    });
+    return y;
+  };
+
+  let boxH;
+  let tableStartY;
+
+  if (isSameAddress) {
+    boxH = Math.max(60, 20 + shipLines.length * lineH + 6);
+
+    doc.rect(M, boxY, cW, boxH).fillAndStroke(lightGray, borderColor);
+    doc.rect(M, boxY, 175, 13).fill(brandColor);
+    doc.fillColor("#fff").font("Helvetica-Bold").fontSize(6.5)
+      .text("BILLING & SHIPPING ADDRESS", M + 5, boxY + 4);
+
+    renderAddressLines(shipLines, M + 6, boxY + 18, cW - 12);
+
+    tableStartY = boxY + boxH + 8;
+  } else {
+    const colW = (cW - 14) / 2;
+    boxH = Math.max(60, 20 + Math.max(billLines.length, shipLines.length) * lineH + 6);
+
+    // Bill To
+    doc.rect(M, boxY, colW, boxH).fillAndStroke(lightGray, borderColor);
+    doc.rect(M, boxY, 44, 13).fill(brandColor);
+    doc.fillColor("#fff").font("Helvetica-Bold").fontSize(6.5)
+      .text("BILL TO", M + 5, boxY + 4);
+    renderAddressLines(billLines, M + 6, boxY + 18, colW - 12);
+
+    // Ship To
+    const sX = M + colW + 14;
+    doc.rect(sX, boxY, colW, boxH).fillAndStroke(lightGray, borderColor);
+    doc.rect(sX, boxY, 46, 13).fill(darkColor);
+    doc.fillColor("#fff").font("Helvetica-Bold").fontSize(6.5)
+      .text("SHIP TO", sX + 5, boxY + 4);
+    renderAddressLines(shipLines, sX + 6, boxY + 18, colW - 12);
+
+    tableStartY = boxY + boxH + 8;
+  }
+
+  // ── ITEMS TABLE ──
+  const tHdrH = 20;
+  const tRowH = 22;
+  const tY0 = tableStartY;
+
+  const COL = {
+    item:  { x: M,       w: 258 },
+    qty:   { x: M + 262, w: 36  },
+    unit:  { x: M + 302, w: 98  },
+    total: { x: M + 404, w: 119 },
+  };
+
+  doc.rect(M, tY0, cW, tHdrH).fill(darkColor);
+  doc.fillColor("#fff").font("Helvetica-Bold").fontSize(7.5);
+  text1Line("ITEM DESCRIPTION", COL.item.x + 6, tY0 + 6, { width: COL.item.w - 6 });
+  text1Line("QTY", COL.qty.x, tY0 + 6, { width: COL.qty.w, align: "center" });
+  text1Line("UNIT PRICE", COL.unit.x, tY0 + 6, { width: COL.unit.w, align: "right" });
+  text1Line("TOTAL", COL.total.x, tY0 + 6, { width: COL.total.w - 4, align: "right" });
+
+  let rY = tY0 + tHdrH;
+  const footerY = pageH - 42;
+  const reserveBelowTable = 120;
+  const maxTableBottom = footerY - reserveBelowTable;
+  const maxRows = Math.max(0, Math.floor((maxTableBottom - rY) / tRowH));
+
+  const edges = (order?.lineItems?.edges || []).slice(0, maxRows);
+  edges.forEach((edge, idx) => {
+    const nd = edge?.node || {};
+    const qty = Number(nd.quantity || 0);
+    const unit = Number(nd?.originalUnitPriceSet?.shopMoney?.amount || 0);
+    const tot = unit * qty;
+    const vari = String(nd.variantTitle || "").trim();
+    const title = String(nd.title || "Item");
+    const displayTitle = vari && vari.toLowerCase() !== "default title" ? `${title} - ${vari}` : title;
+
+    doc.rect(M, rY, cW, tRowH).fill(idx % 2 === 0 ? "#ffffff" : lightGray);
+    doc.strokeColor(borderColor).lineWidth(0.3).moveTo(M, rY + tRowH).lineTo(pageW - M, rY + tRowH).stroke();
+
+    doc.fillColor(darkColor).font("Helvetica").fontSize(8);
+    text1Line(displayTitle, COL.item.x + 6, rY + 6, { width: COL.item.w - 6 });
+    text1Line(String(qty), COL.qty.x, rY + 6, { width: COL.qty.w, align: "center" });
+    text1Line(`Rs. ${unit.toFixed(2)}`, COL.unit.x, rY + 6, { width: COL.unit.w, align: "right" });
+    text1Line(`Rs. ${tot.toFixed(2)}`, COL.total.x, rY + 6, { width: COL.total.w - 4, align: "right" });
+
+    rY += tRowH;
   });
 
-  doc.moveDown(1.0);
-  doc.y = Math.max(doc.y, y + 10);
+  // ── TOTALS ──
+  rY += 10;
+  const tLblX = pageW - M - 210;
+  const tValW = 100;
+  const tLblW = 106;
 
-  const totalsX = 360;
-  doc.strokeColor("#dddddd").moveTo(totalsX, doc.y).lineTo(555, doc.y).stroke();
-  doc.moveDown(0.5);
-
-  function totalRow(label, value) {
-    doc.fontSize(10).fillColor("#444444").text(label, totalsX, doc.y, { width: 110 });
-    doc.fontSize(10).fillColor("#000000").text(value, totalsX + 110, doc.y, { width: 85, align: "right" });
-    doc.moveDown(0.3);
+  function tRow(lbl, val, bold, clr) {
+    const fs = bold ? 9 : 8;
+    doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(fs).fillColor(grayColor);
+    text1Line(lbl, tLblX, rY, { width: tLblW });
+    doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(fs).fillColor(clr || darkColor);
+    text1Line(val, tLblX + tLblW, rY, { width: tValW, align: "right" });
+    rY += bold ? 15 : 13;
   }
 
-  totalRow("Subtotal", formatMoney(subtotal, currency));
-  totalRow("Shipping", shipping === 0 ? "Free" : formatMoney(shipping, currency));
-  if (tax > 0) totalRow("Tax", formatMoney(tax, currency));
-  if (discount > 0) totalRow("Discount", `-${formatMoney(discount, currency)}`);
+  tRow("Subtotal", `Rs. ${subtotal.toFixed(2)}`);
 
-  doc.moveDown(0.2);
-  doc.fontSize(11).fillColor("#000000").text("Total", totalsX, doc.y, { width: 110 });
-  doc.fontSize(11).fillColor("#000000").text(formatMoney(total, currency), totalsX + 110, doc.y, { width: 85, align: "right" });
+  if (productDisc > 0) {
+    tRow("Discount", `-Rs. ${productDisc.toFixed(2)}`, false, "#28a745");
+  }
 
-  doc.moveDown(1.0);
-  doc.fontSize(9).fillColor("#777777").text("This invoice is generated by MakeupMysteryIndia.", 40, doc.y);
+  if (couponDisc > 0) {
+    const couponLabel = order?.appliedCoupons
+      ? `Coupon (${order.appliedCoupons})`
+      : "Coupon Discount";
+    tRow(couponLabel, `-Rs. ${couponDisc.toFixed(2)}`, false, "#28a745");
+  }
+
+  tRow(
+    "Shipping",
+    shipAmt === 0 ? "FREE" : `Rs. ${shipAmt.toFixed(2)}`,
+    false,
+    shipAmt === 0 ? "#28a745" : darkColor
+  );
+
+  if (tax > 0) tRow("Tax", `Rs. ${tax.toFixed(2)}`);
+
+  doc.strokeColor(brandColor).lineWidth(1).moveTo(tLblX, rY + 2).lineTo(pageW - M, rY + 2).stroke();
+  rY += 8;
+
+  const totBgW = tLblW + tValW + 8;
+  doc.rect(tLblX - 4, rY - 2, totBgW, 22).fill(brandColor);
+  doc.fillColor("#fff").font("Helvetica-Bold").fontSize(9.5);
+  text1Line("TOTAL AMOUNT", tLblX, rY + 5, { width: tLblW });
+  text1Line(`Rs. ${total.toFixed(2)}`, tLblX + tLblW, rY + 5, { width: tValW, align: "right" });
+
+  // ── FOOTER (pinned) ──
+  doc.rect(0, footerY, pageW, 42).fill(darkColor);
+  doc.fillColor("#fff").font("Helvetica-Bold").fontSize(9)
+    .text("Thank you for your purchase!", 0, footerY + 8, { width: pageW, align: "center" });
+  doc.fillColor("rgba(255,255,255,0.60)").font("Helvetica").fontSize(7)
+    .text("support@makeupmysteryindia.com  |  makeupmysteryindia.in", 0, footerY + 24, { width: pageW, align: "center" });
 
   doc.end();
   return done;
@@ -1328,6 +1688,32 @@ app.post("/api/review", async (req, res) => {
 
 /* ------------------ ORDER INVOICE (PDF) ------------------ */
 
+app.get("/api/order/:id", async (req, res) => {
+  try {
+    const orderGid = toOrderGid(req.params.id);
+
+    if (!orderGid) {
+      return res.status(400).json({ error: "Invalid order id" });
+    }
+
+    if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) {
+      return res.status(500).json({ error: "Shopify env vars not configured" });
+    }
+
+    const order = await fetchOrderForInvoice(orderGid);
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    return res.status(200).json(order);
+  } catch (err) {
+    console.error("Order Fetch Error:", err.response?.data || err.message);
+    console.error("Order Fetch Stack:", err.stack);
+    return res.status(500).json({ error: "Order fetch failed" });
+  }
+});
+
 app.get("/api/order/:id/invoice", async (req, res) => {
   try {
     const orderGid = toOrderGid(req.params.id);
@@ -1354,6 +1740,7 @@ app.get("/api/order/:id/invoice", async (req, res) => {
     return res.status(200).send(pdfBuffer);
   } catch (err) {
     console.error("Invoice Error:", err.response?.data || err.message);
+    console.error("Invoice Stack:", err.stack);
     return res.status(500).json({ error: "Invoice generation failed" });
   }
 });
@@ -1378,11 +1765,18 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
+    const displayStatus = getDisplayStatus({
+      displayFinancialStatus: order?.displayFinancialStatus,
+      displayFulfillmentStatus: order?.displayFulfillmentStatus,
+      cancelReason: order?.cancelReason,
+      cancelledAt: order?.cancelledAt,
+    });
+
     const shopifyTimeline = buildOrderTrackingTimeline(order);
 
     const trackingNumber = shopifyTimeline?.tracking?.number || null;
     const courier = shopifyTimeline?.tracking?.company || null;
-    const liveTrackingUrl = shopifyTimeline?.tracking?.url || null;
+    let liveTrackingUrl = shopifyTimeline?.tracking?.url || null;
 
     let shiprocketAvailable = false;
     let currentStatus = "";
@@ -1410,6 +1804,13 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       else currentStatus = "Order Placed";
     }
 
+    // Keep summary in sync for non-shipped orders (paid/confirmed but no tracking yet).
+    if (!trackingNumber && !shiprocketAvailable) {
+      currentStatus = displayStatus;
+    } else if (displayStatus === "Cancelled" || displayStatus === "Refunded") {
+      currentStatus = displayStatus;
+    }
+
     const fulfillments = Array.isArray(order?.fulfillments) ? order.fulfillments : [];
     const hasFulfillment = fulfillments.length > 0;
 
@@ -1422,9 +1823,20 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       return dates.length ? dates[0] : null;
     })();
 
-    // Confirmed: fulfillment exists in Shopify.
-    const confirmedDone = hasFulfillment;
-    const confirmedTime = firstFulfillmentCreatedAt;
+    // Confirmed = order is paid OR has fulfillment
+    const financialStatus = String(
+      order?.displayFinancialStatus || ""
+    ).toUpperCase();
+
+    const isPaid =
+      financialStatus === "PAID" ||
+      financialStatus === "PARTIALLY_PAID" ||
+      hasFulfillment;
+
+    const confirmedDone = isPaid;
+    const confirmedTime = isPaid
+      ? (firstFulfillmentCreatedAt || placedTime)
+      : null;
 
     const cleanStatus = normalizeShiprocketStatus(currentStatus);
 
@@ -1485,12 +1897,35 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       ? (sortedEvents.length ? (sortedEvents[sortedEvents.length - 1].time || null) : null)
       : null;
 
+    // Human-friendly fields expected by the Flutter tracking screen
+    let estimatedDeliveryText = "Calculating...";
+    if (estimatedDelivery) {
+      const d = new Date(estimatedDelivery);
+      estimatedDeliveryText = Number.isNaN(d.getTime())
+        ? String(estimatedDelivery)
+        : d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+    } else if (cleanStatus === "Delivered" || currentStatus === "Delivered") {
+      estimatedDeliveryText = "Delivered";
+    } else if (!trackingNumber) {
+      estimatedDeliveryText = "Will update once shipped";
+    }
+
+    let courierDisplay = "Not assigned yet";
+    if (courier && trackingNumber) courierDisplay = `${courier} • ${trackingNumber}`;
+    else if (trackingNumber) courierDisplay = String(trackingNumber);
+
+    if (!liveTrackingUrl && trackingNumber) {
+      liveTrackingUrl = `https://shiprocket.co/tracking/${encodeURIComponent(String(trackingNumber))}`;
+    }
+
     return res.json({
       orderId: order.id,
+      orderName: order.name,
       trackingNumber,
       courier,
       currentStatus,
       estimatedDelivery,
+      displayStatus,
       timeline: [
         { step: "Order Placed", done: true, time: placedTime },
         { step: "Confirmed", done: Boolean(confirmedDone), time: confirmedTime },
@@ -1501,6 +1936,8 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       trackingEvents,
       liveTrackingUrl,
       shiprocket_available: shiprocketAvailable,
+      estimatedDeliveryText,
+      courierDisplay,
     });
   } catch (err) {
     console.error("Order Tracking Error:", err.response?.data || err.message);
@@ -1654,7 +2091,12 @@ app.post("/api/payment/verify", async (req, res) => {
       city,
       state,
       pincode,
-      amount
+      amount,
+      couponCode,
+      couponDiscount,
+      shippingAmount,
+      totalMrp,
+      productDiscount
     } = req.body;
 
     /* ------------------ VERIFY SIGNATURE ------------------ */
@@ -1675,6 +2117,31 @@ app.post("/api/payment/verify", async (req, res) => {
     const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
 
     const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+    const cartSubtotal = cart.reduce((sum, item) => {
+      return sum + (Number(item.price || 0) * Number(item.quantity || 1));
+    }, 0);
+    const passedShipping = Number(shippingAmount);
+    const hasPassedShipping = Number.isFinite(passedShipping) && passedShipping >= 0;
+
+    const finalShipping = hasPassedShipping
+      ? {
+          title: passedShipping === 0 ? "Free Shipping" : "Standard Shipping",
+          price: passedShipping.toFixed(2),
+          code: passedShipping === 0 ? "FREE" : "FLAT",
+        }
+      : calculateShipping(cartSubtotal, false);
+
+    const couponDisc = Math.max(0, Number(couponDiscount || 0));
+    const orderTotal = Math.max(0, cartSubtotal + Number(finalShipping.price) - couponDisc);
+
+    // Only add discount_codes if coupon applied
+    const discountCodesPayload = (couponCode && Number(couponDiscount) > 0)
+      ? [{
+          code: String(couponCode),
+          amount: Number(couponDiscount).toFixed(2),
+          type: "fixed_amount",
+        }]
+      : [];
 
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
@@ -1697,18 +2164,20 @@ app.post("/api/payment/verify", async (req, res) => {
 
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
 
+    const shopifyCustomerId = await getShopifyCustomerIdByEmail(email);
+
     const shopifyOrder = await axios.post(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
       {
         order: {
   line_items: cart.map(item => ({
-    variant_id: item.variant_id,
+    variant_id: toNumericId(item.variant_id),
     quantity: item.quantity,
   })),
 
   financial_status: "paid",
 
-  customer: {
+  customer: shopifyCustomerId ? { id: shopifyCustomerId } : {
     first_name,
     last_name,
     email,
@@ -1741,16 +2210,19 @@ app.post("/api/payment/verify", async (req, res) => {
 
   shipping_lines: [
     {
-      title: "Free Shipping",
-      price: "0.00",
+      title: finalShipping.title,
+      price: finalShipping.price,
+      code:  finalShipping.code,
     },
   ],
+
+  discount_codes: discountCodesPayload,
 
   transactions: [
     {
       kind: "sale",
       status: "success",
-      amount: (amount / 100).toString(),
+      amount: orderTotal.toFixed(2),
       gateway: "Razorpay",
     },
   ],
@@ -1768,6 +2240,14 @@ app.post("/api/payment/verify", async (req, res) => {
     { name: "Order ID", value: razorpay_order_id },
     { name: "Customer Phone", value: phone },
     { name: "Receipt", value: razorpayOrder.receipt },
+    ...(couponCode ? [
+      { name: "Coupon Code", value: String(couponCode) },
+      { name: "Coupon Discount", value: String(couponDiscount || 0) },
+    ] : []),
+    { name: "Shipping Amount", value: String(finalShipping.price) },
+    { name: "Final Payable", value: String(orderTotal.toFixed(2)) },
+    ...(totalMrp !== undefined && totalMrp !== null ? [{ name: "Total MRP", value: String(totalMrp) }] : []),
+    ...(productDiscount !== undefined && productDiscount !== null ? [{ name: "Product Discount", value: String(productDiscount) }] : []),
   ],
 
   metafields: [
@@ -1819,6 +2299,23 @@ async function startServer() {
     console.log("MongoDB Atlas connected ✅");
 
     const PORT = process.env.PORT || 5500;
+
+    const logoCandidates = [
+      path.join(__dirname, "assets", "logo.png"),
+      path.join(__dirname, "assets", "Logo.png"),
+      path.join(__dirname, "assets", "logo.jpg"),
+      path.join(__dirname, "src", "assets", "logo.png"),
+      path.join(__dirname, "images", "logo.png"),
+      path.join(__dirname, "public", "logo.png"),
+      path.join(__dirname, "public", "images", "logo.png"),
+    ];
+    const foundLogo = logoCandidates.find((p) => fs.existsSync(p));
+    if (foundLogo) {
+      console.log("✅ Logo found at:", foundLogo);
+    } else {
+      console.warn("⚠️  Logo not found. Place logo.png in assets/ folder.");
+      console.warn("Searched paths:", logoCandidates);
+    }
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT} 🚀`);
