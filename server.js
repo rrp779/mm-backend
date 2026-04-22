@@ -26,6 +26,152 @@ const razorpay = new Razorpay({
 });
 
 const SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket_jwt";
+const SHIPROCKET_TRACKING_CACHE_PREFIX = "shiprocket_track:";
+const ORDER_STATUS_CACHE_PREFIX = "order_status:";
+const ORDER_STATUS_CACHE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
+const TRACKING_STATE_CACHE_PREFIX = "tracking_state:";
+const TRACKING_STATE_TTL_SEC = 14 * 24 * 60 * 60; // 14 days
+
+const ADMIN_MONITOR_TOKEN = String(process.env.ADMIN_MONITOR_TOKEN || "").trim();
+const MONITORING_ENABLED =
+  isTruthyEnv(process.env.MONITORING_ENABLED) ||
+  String(process.env.NODE_ENV || "").trim().toLowerCase() !== "production";
+
+const TRACKING_STUCK_HOURS = Number(process.env.TRACKING_STUCK_HOURS || 72);
+const SHIPROCKET_FAIL_WINDOW_MIN = Number(process.env.SHIPROCKET_FAIL_WINDOW_MIN || 30);
+const SHIPROCKET_FAIL_THRESHOLD = Number(process.env.SHIPROCKET_FAIL_THRESHOLD || 5);
+
+function isTruthyEnv(value) {
+  const s = String(value ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on";
+}
+
+// Enable verbose order/tracking logs only when explicitly requested via env.
+// Keep production logs minimal by default.
+const ORDER_DEBUG_ENABLED =
+  isTruthyEnv(process.env.DEBUG_ORDERS) || isTruthyEnv(process.env.ORDER_DEBUG);
+
+function orderLog(...args) {
+  if (!ORDER_DEBUG_ENABLED) return;
+  console.log(...args);
+}
+
+function orderErr(...args) {
+  if (!ORDER_DEBUG_ENABLED) return;
+  console.error(...args);
+}
+
+function statusRank(status) {
+  const s = String(status || "").trim().toLowerCase();
+  if (!s) return 0;
+  // Core lifecycle priority (requested):
+  // Confirmed = 1, Shipped = 2, Out for Delivery = 3, Delivered = 4
+  if (s === "confirmed") return 1;
+  if (s === "shipped" || s === "partially shipped") return 2;
+  if (s === "out for delivery") return 3;
+  if (s === "delivered") return 4;
+
+  // Terminal / override states
+  if (s === "returned" || s === "delivery failed") return 4;
+  if (s === "refunded") return 5;
+  if (s === "cancelled") return 6;
+
+  // Pre-confirmed informational states (kept below Confirmed)
+  if (s === "order placed") return 0.5;
+  if (s === "processing") return 0.25;
+  return 0;
+}
+
+function lockOrderStatus({ orderId, nextStatus, meta }) {
+  const key = `${ORDER_STATUS_CACHE_PREFIX}${String(orderId || "")}`;
+  const prev = cache.get(key);
+  const prevStatus = prev?.status;
+
+  const nextRank = statusRank(nextStatus);
+  const prevRank = statusRank(prevStatus);
+
+  const finalStatus = nextRank >= prevRank ? nextStatus : prevStatus;
+  cache.set(key, { status: finalStatus, updatedAt: Date.now() }, ORDER_STATUS_CACHE_TTL_SEC);
+
+  monitorLog("status_lock", {
+    orderId: String(orderId || ""),
+    previousStatus: prevStatus || null,
+    newComputedStatus: nextStatus || null,
+    finalStatus: finalStatus || null,
+    ...(meta || {}),
+  });
+
+  return finalStatus;
+}
+
+function monitorLog(event, payload) {
+  if (!MONITORING_ENABLED) return;
+  try {
+    console.log(
+      "[monitor]",
+      JSON.stringify({
+        event,
+        ts: new Date().toISOString(),
+        ...(payload || {}),
+      })
+    );
+  } catch (e) {
+    console.log("[monitor]", event, payload);
+  }
+}
+
+function monitorAlert(event, payload) {
+  if (!MONITORING_ENABLED) return;
+  try {
+    console.error(
+      "[ALERT]",
+      JSON.stringify({
+        event,
+        ts: new Date().toISOString(),
+        ...(payload || {}),
+      })
+    );
+  } catch (e) {
+    console.error("[ALERT]", event, payload);
+  }
+}
+
+function errorInfo(err) {
+  const status = err?.response?.status;
+  const code = err?.code;
+  const message = err?.message ? String(err.message) : String(err || "");
+  return { message, status: status ?? null, code: code ?? null };
+}
+
+function parseBoolQuery(value) {
+  const s = String(value ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on";
+}
+
+function recordTrackingState(state) {
+  if (!state || !state.orderId) return;
+  const key = `${TRACKING_STATE_CACHE_PREFIX}${String(state.orderId)}`;
+  cache.set(key, { ...state }, TRACKING_STATE_TTL_SEC);
+}
+
+function listTrackingStates() {
+  const keys = typeof cache.keys === "function" ? cache.keys() : [];
+  const out = [];
+  for (const k of keys) {
+    if (!String(k).startsWith(TRACKING_STATE_CACHE_PREFIX)) continue;
+    const v = cache.get(k);
+    if (v) out.push(v);
+  }
+  return out;
+}
+
+function newReqId() {
+  try {
+    return crypto.randomBytes(6).toString("hex");
+  } catch {
+    return `${Date.now()}`;
+  }
+}
 
 function toNumericId(gid) {
   if (!gid) return null;
@@ -100,17 +246,54 @@ function normalizeShiprocketStatus(raw) {
     case "IT":
       return "In Transit";
     case "RTO":
-      return "Return to Origin";
+      return "Returned";
     case "CANC":
       return "Cancelled";
+    case "SHIPPED":
+      return "Shipped";
+    case "DELIVERY_FAILED":
+    case "DELIVERY FAIL":
+    case "DELIVERY FAILED":
+    case "FAILED":
+      return "Delivery Failed";
     default:
       // Common full-text variants (case-insensitive) — keep output consistent for timeline mapping.
       if (code === "DELIVERED") return "Delivered";
       if (code === "OUT FOR DELIVERY" || code === "OUT_FOR_DELIVERY") return "Out for Delivery";
       if (code === "IN TRANSIT" || code === "IN_TRANSIT") return "In Transit";
       if (code === "PICKED UP" || code === "PICKED_UP") return "Picked Up";
+      if (code === "RETURN TO ORIGIN" || code === "RETURN_TO_ORIGIN") return "Returned";
+      if (code === "RTO IN TRANSIT" || code === "RTO_IN_TRANSIT") return "Returned";
+      if (code === "DELIVERY FAILED" || code === "DELIVERY_FAILED") return "Delivery Failed";
       return s;
   }
+}
+
+function formatPrettyDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function formatShortMonthDay(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function formatEtaRangeFromDateOnly(yyyyMmDd) {
+  const s = String(yyyyMmDd || "").trim();
+  if (!s) return null;
+  const d0 = new Date(`${s}T00:00:00Z`);
+  if (Number.isNaN(d0.getTime())) return null;
+  const d1 = new Date(d0.getTime() + 24 * 60 * 60 * 1000);
+  const a = formatShortMonthDay(d0);
+  const b = formatShortMonthDay(d1);
+  if (!a) return null;
+  if (!b) return a;
+  return `${a} - ${b}`;
 }
 
 function getDisplayStatus(order) {
@@ -134,10 +317,14 @@ function getDisplayStatus(order) {
   if (financial === "voided") return "Cancelled";
   if (financial === "refunded") return "Refunded";
   if (financial === "partially_refunded") return "Partially Refunded";
-  if (fulfillment === "fulfilled") return "Delivered";
-  if (fulfillment === "partial") return "Partially Shipped";
+  // NOTE: "Fulfilled" in Shopify generally means the order has been shipped/fulfilled,
+  // not necessarily delivered to the customer. We only show "Delivered" when the
+  // shipping provider (Shiprocket) indicates delivery.
+  if (fulfillment === "fulfilled" || fulfillment === "in_progress") return "Shipped";
+  if (fulfillment === "partial" || fulfillment === "partially_fulfilled") return "Partially Shipped";
   if (financial === "paid" || financial === "partially_paid") return "Confirmed";
-  if (financial === "pending") return "Pending Payment";
+  // Keep lifecycle simple for customers: show Confirmed initially.
+  if (financial === "pending") return "Confirmed";
   return "Processing";
 }
 
@@ -226,14 +413,31 @@ function extractShiprocketEvents(payload) {
   return events;
 }
 
-async function fetchShiprocketTrackingByAwb(awb) {
+async function fetchShiprocketTrackingByAwb(awb, opts) {
   const token = await getShiprocketToken();
 
+  const awbStr = String(awb || "").trim();
+  if (!awbStr) {
+    const err = new Error("Invalid AWB");
+    err.code = "SHIPROCKET_AWB_INVALID";
+    throw err;
+  }
+
+  const cacheKey = `${SHIPROCKET_TRACKING_CACHE_PREFIX}${awbStr}`;
+  const force = Boolean(opts?.force);
+  const cached = force ? null : cache.get(cacheKey);
+  if (cached) {
+    orderLog("[shiprocket] track:cache_hit", { awb: awbStr });
+    return cached;
+  }
+
+  orderLog("[shiprocket] track:request", { awb: awbStr });
+
   const response = await axios.get(
-    `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${encodeURIComponent(String(awb))}`,
+    `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${encodeURIComponent(awbStr)}`,
     {
       headers: { Authorization: `Bearer ${token}` },
-      timeout: 10000,
+      timeout: 8000,
     }
   );
 
@@ -249,13 +453,63 @@ async function fetchShiprocketTrackingByAwb(awb) {
   const estimatedDelivery = extractShiprocketEDD(payload);
   const events = extractShiprocketEvents(payload);
 
-  return { status, estimatedDelivery, events, raw: payload };
+  orderLog("[shiprocket] track:response", {
+    httpStatus: response?.status,
+    statusRaw: String(statusRaw || ""),
+    status,
+    estimatedDelivery,
+    eventsCount: Array.isArray(events) ? events.length : 0,
+  });
+
+  const result = { status, estimatedDelivery, events, raw: payload };
+  // Cache briefly to reduce API calls from app refresh/polling.
+  cache.set(cacheKey, result, 30);
+  return result;
 }
 
 
 
 app.use(cors());
 app.use(express.json());
+
+app.use((req, res, next) => {
+  res.locals.reqId = res.locals.reqId || newReqId();
+  next();
+});
+
+app.use("/api/order", (req, res, next) => {
+  const reqId = res.locals.reqId;
+  const startedAt = Date.now();
+
+  const bodyKeys =
+    req.method === "GET" || !req.body || typeof req.body !== "object"
+      ? null
+      : Object.keys(req.body);
+
+  orderLog(`[${reqId}] order:req`, {
+    method: req.method,
+    url: req.originalUrl,
+    params: req.params,
+    query: req.query,
+    bodyKeys,
+  });
+
+  res.on("finish", () => {
+    orderLog(`[${reqId}] order:res`, {
+      statusCode: res.statusCode,
+      ms: Date.now() - startedAt,
+    });
+  });
+
+  next();
+});
+
+function requireAdminMonitor(req, res, next) {
+  if (!ADMIN_MONITOR_TOKEN) return res.status(503).json({ error: "Admin monitor token not configured" });
+  const token = String(req.headers["x-admin-token"] || "").trim();
+  if (!token || token !== ADMIN_MONITOR_TOKEN) return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
 
 function toOrderGid(id) {
   const raw = decodeURIComponent(String(id || "")).trim();
@@ -310,7 +564,6 @@ async function hasPurchasedProduct({ email, productGid }) {
   if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return false;
 
   const url = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`;
-
   const response = await axios.post(
       url,
       {
@@ -369,6 +622,8 @@ async function fetchOrderForInvoice(orderGid) {
     .split("?")[0]
     .trim();
 
+  orderLog("[invoice] shopify:request", { orderGid: String(orderGid), numericId });
+
   const response = await axios.get(
     `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders/${numericId}.json`,
     {
@@ -379,7 +634,22 @@ async function fetchOrderForInvoice(orderGid) {
     }
   );
 
+  orderLog("[invoice] shopify:response", {
+    httpStatus: response?.status,
+    hasOrder: Boolean(response?.data?.order),
+  });
+
   const order = response?.data?.order;
+
+  orderLog("[invoice] order:summary", {
+    id: order?.id,
+    name: order?.name,
+    financial_status: order?.financial_status,
+    fulfillment_status: order?.fulfillment_status,
+    cancelled_at: order?.cancelled_at,
+    cancel_reason: order?.cancel_reason,
+  });
+
   if (!order) return null;
 
   const noteAttrs = {};
@@ -561,6 +831,8 @@ async function fetchOrderForInvoice(orderGid) {
 async function fetchOrderForTracking(orderGid) {
   const url = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`;
 
+  orderLog("[tracking] shopify:request", { orderGid: String(orderGid) });
+
   const response = await axios.post(
     url,
     {
@@ -598,6 +870,16 @@ async function fetchOrderForTracking(orderGid) {
   );
 
   const data = response.data;
+
+  orderLog("[tracking] shopify:response", {
+    httpStatus: response?.status,
+    hasErrors: Boolean(data?.errors?.length),
+    orderName: data?.data?.order?.name,
+    displayFinancialStatus: data?.data?.order?.displayFinancialStatus,
+    displayFulfillmentStatus: data?.data?.order?.displayFulfillmentStatus,
+    fulfillmentCount: Array.isArray(data?.data?.order?.fulfillments) ? data.data.order.fulfillments.length : 0,
+  });
+
   if (data?.errors?.length) {
     const msg = data.errors[0]?.message || "Shopify GraphQL error";
     const err = new Error(msg);
@@ -616,9 +898,11 @@ function buildOrderTrackingTimeline(order) {
   const fulfillments = Array.isArray(order?.fulfillments) ? order.fulfillments : [];
   const hasFulfillment = fulfillments.length > 0;
 
-  const delivered = fulfillmentStatus === "FULFILLED";
+  // Delivered is driven by Shiprocket tracking; Shopify fulfillment does not mean delivered.
+  // This timeline is only a Shopify fallback when Shiprocket data is not available.
+  const delivered = false;
   const shipped =
-    delivered ||
+    fulfillmentStatus === "FULFILLED" ||
     fulfillmentStatus === "IN_PROGRESS" ||
     fulfillmentStatus === "PARTIALLY_FULFILLED" ||
     hasFulfillment;
@@ -634,7 +918,20 @@ function buildOrderTrackingTimeline(order) {
     return null;
   })();
 
-  const outForDelivery = Boolean(shipped && !delivered && firstTracking);
+  const outForDelivery = Boolean(shipped && firstTracking);
+
+  orderLog("[timeline] computed", {
+    orderId: order?.id,
+    orderName: order?.name,
+    fulfillmentStatus,
+    fulfillments: fulfillments.length,
+    shipped,
+    delivered,
+    outForDelivery,
+    tracking: firstTracking
+      ? { number: firstTracking.number || null, company: firstTracking.company || null, url: firstTracking.url || null }
+      : null,
+  });
 
   return {
     createdAt,
@@ -1060,12 +1357,12 @@ app.get("/api/sections", async (req, res) => {
     const cached = cache.get("sections");
 
     if (cached) {
-      console.log("⚡ CACHE HIT");
+      // cache hit
       return res.json(cached);
     }
 
     // 🔥 2. DB call
-    console.log("🐢 DB HIT");
+    // db hit
     const sections = await Section.find().sort({ order: 1 }).lean(); 
 
     // 🔥 3. save in cache
@@ -1134,11 +1431,11 @@ app.get("/api/products/:id", async (req, res) => {
 
     const cached = cache.get(cacheKey);
     if (cached) {
-      console.log("⚡ PRODUCT CACHE HIT");
+      // cache hit
       return res.json(cached);
     }
 
-    console.log("🐢 PRODUCT API HIT");
+    // api hit
 
     const response = await axios.post(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
@@ -1195,11 +1492,11 @@ app.get("/api/shopify/collections", async (req, res) => {
 
     const cached = cache.get(cacheKey);
     if (cached) {
-      console.log("⚡ COLLECTION CACHE HIT");
+      // cache hit
       return res.json(cached);
     }
 
-    console.log("🐢 COLLECTION API HIT");
+    // api hit
 
     const response = await axios.get(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/collections.json?limit=20`,
@@ -1240,11 +1537,11 @@ app.get("/api/shopify/search", async (req, res) => {
 
     const cached = cache.get(cacheKey);
     if (cached) {
-      console.log("⚡ SEARCH CACHE HIT");
+      // cache hit
       return res.json(cached);
     }
 
-    console.log("🐢 SEARCH API HIT");
+    // api hit
 
     const query = `
     {
@@ -1418,7 +1715,7 @@ app.get("/api/shopify/best-selling", async (req, res) => {
     res.json(products);
 
   } catch (err) {
-    console.error("Best Selling Error:", err.response?.data || err.message);
+    console.error("Best Selling Error:", errorInfo(err));
     res.json([]);
   }
 });
@@ -1497,7 +1794,7 @@ app.get("/api/shopify/search", async (req, res) => {
     res.json([]);
 
   } catch (err) {
-    console.error("GraphQL Search Error:", err.response?.data || err.message);
+    console.error("GraphQL Search Error:", errorInfo(err));
     res.status(500).json([]);
   }
 });
@@ -1578,7 +1875,7 @@ app.get("/api/shopify/coupons", async (req, res) => {
 
   } catch (err) {
 
-    console.error("Coupons Fetch Error:", err.response?.data || err.message);
+    console.error("Coupons Fetch Error:", errorInfo(err));
 
     res.status(500).json([]);
 
@@ -1681,7 +1978,7 @@ app.post("/api/review", async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Review Create Error:", err.response?.data || err.message);
+    console.error("Review Create Error:", errorInfo(err));
     res.status(500).json({ error: "Failed to submit review" });
   }
 });
@@ -1690,6 +1987,7 @@ app.post("/api/review", async (req, res) => {
 
 app.get("/api/order/:id", async (req, res) => {
   try {
+    const reqId = res.locals.reqId;
     const orderGid = toOrderGid(req.params.id);
 
     if (!orderGid) {
@@ -1706,9 +2004,33 @@ app.get("/api/order/:id", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    return res.status(200).json(order);
+    const computedStatus = getDisplayStatus(order);
+    const orderKey = `${ORDER_STATUS_CACHE_PREFIX}${String(order?.id || orderGid || "")}`;
+    const previousStatus = cache.get(orderKey)?.status || null;
+
+    const lockedStatus = lockOrderStatus({
+      orderId: order?.id || orderGid,
+      nextStatus: computedStatus,
+      meta: {
+        endpoint: "/api/order/:id",
+        reqId,
+      },
+    });
+
+    orderLog(`[${reqId}] order:details`, {
+      orderGid,
+      numericId: order?.id,
+      name: order?.name,
+      previousStatus,
+      newComputedStatus: computedStatus,
+      finalStatus: lockedStatus,
+      financial_status: order?.financial_status,
+      fulfillment_status: order?.fulfillment_status,
+    });
+
+    return res.status(200).json({ ...order, displayStatus: lockedStatus });
   } catch (err) {
-    console.error("Order Fetch Error:", err.response?.data || err.message);
+    console.error("Order Fetch Error:", errorInfo(err));
     console.error("Order Fetch Stack:", err.stack);
     return res.status(500).json({ error: "Order fetch failed" });
   }
@@ -1716,6 +2038,7 @@ app.get("/api/order/:id", async (req, res) => {
 
 app.get("/api/order/:id/invoice", async (req, res) => {
   try {
+    const reqId = res.locals.reqId;
     const orderGid = toOrderGid(req.params.id);
 
     if (!orderGid) {
@@ -1731,6 +2054,13 @@ app.get("/api/order/:id/invoice", async (req, res) => {
     if (!order) {
       return res.status(404).json({ error: "Order not found" });
     }
+
+    orderLog(`[${reqId}] invoice:build`, {
+      orderGid,
+      numericId: order?.id,
+      name: order?.name,
+      displayStatus: getDisplayStatus(order),
+    });
 
     const pdfBuffer = await buildInvoicePdfBuffer(order);
 
@@ -1739,7 +2069,7 @@ app.get("/api/order/:id/invoice", async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="invoice-${safeName || "order"}.pdf"`);
     return res.status(200).send(pdfBuffer);
   } catch (err) {
-    console.error("Invoice Error:", err.response?.data || err.message);
+    console.error("Invoice Error:", errorInfo(err));
     console.error("Invoice Stack:", err.stack);
     return res.status(500).json({ error: "Invoice generation failed" });
   }
@@ -1749,6 +2079,7 @@ app.get("/api/order/:id/invoice", async (req, res) => {
 
 app.get("/api/order/:id/tracking", async (req, res) => {
   try {
+    const reqId = res.locals.reqId;
     const orderGid = toOrderGid(req.params.id);
 
     if (!orderGid) {
@@ -1765,6 +2096,17 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
+    orderLog(`[${reqId}] tracking:order`, {
+      orderGid,
+      id: order?.id,
+      name: order?.name,
+      displayFinancialStatus: order?.displayFinancialStatus,
+      displayFulfillmentStatus: order?.displayFulfillmentStatus,
+      cancelReason: order?.cancelReason,
+      cancelledAt: order?.cancelledAt,
+      fulfillments: Array.isArray(order?.fulfillments) ? order.fulfillments.length : 0,
+    });
+
     const displayStatus = getDisplayStatus({
       displayFinancialStatus: order?.displayFinancialStatus,
       displayFulfillmentStatus: order?.displayFulfillmentStatus,
@@ -1778,37 +2120,47 @@ app.get("/api/order/:id/tracking", async (req, res) => {
     const courier = shopifyTimeline?.tracking?.company || null;
     let liveTrackingUrl = shopifyTimeline?.tracking?.url || null;
 
+    const trackingEnabled = Boolean(trackingNumber && String(trackingNumber).trim().length > 0);
+    const forceRefresh = parseBoolQuery(req.query?.force);
+
+    orderLog(`[${reqId}] tracking:shopify`, {
+      trackingNumber,
+      courier,
+      liveTrackingUrl,
+      shopifySteps: Array.isArray(shopifyTimeline?.steps) ? shopifyTimeline.steps.map((s) => ({ key: s.key, completed: s.completed })) : null,
+    });
+
     let shiprocketAvailable = false;
-    let currentStatus = "";
+    let shiprocketStatus = "";
     let estimatedDelivery = null;
     let trackingEvents = [];
+    let shiprocketDelayed = false;
 
-    if (trackingNumber) {
+    if (trackingEnabled) {
       try {
-        const shiprocket = await fetchShiprocketTrackingByAwb(trackingNumber);
+        const shiprocket = await fetchShiprocketTrackingByAwb(trackingNumber, { force: forceRefresh });
         shiprocketAvailable = true;
-        currentStatus = shiprocket.status || "";
+        shiprocketStatus = normalizeShiprocketStatus(shiprocket.status || "");
         estimatedDelivery = shiprocket.estimatedDelivery || null;
         trackingEvents = shiprocket.events || [];
       } catch (e) {
         shiprocketAvailable = false;
+        shiprocketDelayed = true;
         console.error("Shiprocket Tracking Error:", e?.response?.data || e.message);
+        const failKey = `shiprocket_fail_window:${Math.floor(Date.now() / (SHIPROCKET_FAIL_WINDOW_MIN * 60 * 1000))}`;
+        const currFails = Number(cache.get(failKey) || 0) + 1;
+        cache.set(failKey, currFails, SHIPROCKET_FAIL_WINDOW_MIN * 60);
+        monitorLog("shiprocket_api_failure", {
+          orderId: order?.id,
+          awbCode: trackingNumber,
+          shiprocketStatus: null,
+          shopifyStatus: { displayFulfillmentStatus: order?.displayFulfillmentStatus, displayFinancialStatus: order?.displayFinancialStatus },
+          error: e?.message || "Shiprocket failure",
+        });
+        if (currFails >= SHIPROCKET_FAIL_THRESHOLD) {
+          monitorAlert("shiprocket_api_repeated_failures", { failures: currFails, windowMin: SHIPROCKET_FAIL_WINDOW_MIN });
+        }
       }
-    }
-
-    if (!currentStatus) {
-      const s = String(order?.displayFulfillmentStatus || "").toUpperCase();
-      if (s === "FULFILLED") currentStatus = "Delivered";
-      else if (s === "IN_PROGRESS" || s === "PARTIALLY_FULFILLED") currentStatus = "In Transit";
-      else if (shopifyTimeline?.steps?.find((x) => x?.key === "confirmed")?.completed) currentStatus = "Confirmed";
-      else currentStatus = "Order Placed";
-    }
-
-    // Keep summary in sync for non-shipped orders (paid/confirmed but no tracking yet).
-    if (!trackingNumber && !shiprocketAvailable) {
-      currentStatus = displayStatus;
-    } else if (displayStatus === "Cancelled" || displayStatus === "Refunded") {
-      currentStatus = displayStatus;
     }
 
     const fulfillments = Array.isArray(order?.fulfillments) ? order.fulfillments : [];
@@ -1823,33 +2175,57 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       return dates.length ? dates[0] : null;
     })();
 
-    // Confirmed = order is paid OR has fulfillment
-    const financialStatus = String(
-      order?.displayFinancialStatus || ""
-    ).toUpperCase();
+    // Confirmed should show immediately after order is created (Amazon/Flipkart style).
+    // We still keep cancellation/refund overrides via `displayStatus` below.
+    const confirmedDone = Boolean(placedTime);
+    const confirmedTime = confirmedDone ? (firstFulfillmentCreatedAt || toIsoDate(order?.processedAt) || placedTime) : null;
 
-    const isPaid =
-      financialStatus === "PAID" ||
-      financialStatus === "PARTIALLY_PAID" ||
+    // Shiprocket-first lifecycle status mapping (delivery-related updates)
+    const shiprocketLifecycle = (() => {
+      const s = String(shiprocketStatus || "").trim();
+      if (!shiprocketAvailable || !s) return null;
+      if (s === "Delivered") return "Delivered";
+      if (s === "Out for Delivery") return "Out for Delivery";
+      if (s === "Returned") return "Returned";
+      if (s === "Delivery Failed") return "Delivery Failed";
+      if (s === "Cancelled") return "Cancelled";
+      if (["In Transit", "Shipped", "Picked Up"].includes(s)) return "Shipped";
+      return s;
+    })();
+
+    // Shopify fallback when Shiprocket is not available
+    const shopifyFulfillment = String(order?.displayFulfillmentStatus || "").toUpperCase();
+    const shopifyFinancial = String(order?.displayFinancialStatus || "").toUpperCase();
+    const shopifyShipped =
+      shopifyFulfillment === "FULFILLED" ||
+      shopifyFulfillment === "IN_PROGRESS" ||
+      shopifyFulfillment === "PARTIALLY_FULFILLED" ||
       hasFulfillment;
 
-    const confirmedDone = isPaid;
-    const confirmedTime = isPaid
-      ? (firstFulfillmentCreatedAt || placedTime)
-      : null;
+    orderLog(`[${reqId}] tracking:status`, {
+      displayStatus,
+      shiprocketAvailable,
+      shiprocketStatus,
+      shiprocketLifecycle,
+      estimatedDelivery,
+      trackingEventsCount: Array.isArray(trackingEvents) ? trackingEvents.length : 0,
+    });
 
-    const cleanStatus = normalizeShiprocketStatus(currentStatus);
+    const cleanStatus = shiprocketAvailable ? normalizeShiprocketStatus(shiprocketStatus) : "";
 
     const shiprocketShippedStatuses = new Set([
+      "Shipped",
       "Picked Up",
       "In Transit",
       "Out for Delivery",
       "Delivered",
+      "Returned",
+      "Delivery Failed",
     ]);
 
     const shippedDone = shiprocketAvailable
       ? shiprocketShippedStatuses.has(cleanStatus)
-      : (shopifyTimeline?.steps?.find((x) => x?.key === "shipped")?.completed === true);
+      : (trackingEnabled ? true : shopifyShipped);
 
     const outForDeliveryDone = shiprocketAvailable
       ? (cleanStatus === "Out for Delivery" || cleanStatus === "Delivered")
@@ -1857,7 +2233,7 @@ app.get("/api/order/:id/tracking", async (req, res) => {
 
     const deliveredDone = shiprocketAvailable
       ? (cleanStatus === "Delivered")
-      : (shopifyTimeline?.steps?.find((x) => x?.key === "delivered")?.completed === true);
+      : false;
 
     const sortedEvents = (trackingEvents || [])
       .filter((e) => e?.time)
@@ -1897,40 +2273,168 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       ? (sortedEvents.length ? (sortedEvents[sortedEvents.length - 1].time || null) : null)
       : null;
 
+    const lastCarrierUpdateAt = (() => {
+      if (sortedEvents.length) return sortedEvents[sortedEvents.length - 1].time || null;
+      return null;
+    })();
+
     // Human-friendly fields expected by the Flutter tracking screen
-    let estimatedDeliveryText = "Calculating...";
-    if (estimatedDelivery) {
-      const d = new Date(estimatedDelivery);
-      estimatedDeliveryText = Number.isNaN(d.getTime())
-        ? String(estimatedDelivery)
-        : d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
-    } else if (cleanStatus === "Delivered" || currentStatus === "Delivered") {
-      estimatedDeliveryText = "Delivered";
-    } else if (!trackingNumber) {
-      estimatedDeliveryText = "Will update once shipped";
+    // Show ETA as soon as AWB exists (shipment created), even if shipment hasn't moved yet.
+    let estimatedDeliveryText = "After shipment";
+    if (shiprocketLifecycle === "Delivered" || deliveredDone) {
+      const pretty = formatPrettyDate(deliveredTime) || formatPrettyDate(estimatedDelivery) || null;
+      estimatedDeliveryText = pretty ? `Delivered on ${pretty}` : "Delivered";
+    } else if (shiprocketLifecycle === "Returned") {
+      estimatedDeliveryText = "Returned";
+    } else if (shiprocketLifecycle === "Delivery Failed") {
+      estimatedDeliveryText = "Delivery Failed";
+    } else if (shiprocketLifecycle === "Out for Delivery" || outForDeliveryDone) {
+      estimatedDeliveryText = "Arriving Today";
+    } else if (trackingEnabled) {
+      if (shiprocketAvailable) {
+        const range = formatEtaRangeFromDateOnly(estimatedDelivery);
+        estimatedDeliveryText = range || "Estimated delivery will be updated shortly";
+      } else {
+        estimatedDeliveryText = "Estimated delivery will be updated shortly";
+      }
+    } else {
+      estimatedDeliveryText = "After shipment";
     }
 
     let courierDisplay = "Not assigned yet";
     if (courier && trackingNumber) courierDisplay = `${courier} • ${trackingNumber}`;
     else if (trackingNumber) courierDisplay = String(trackingNumber);
 
+    orderLog(`[${reqId}] tracking:timeline`, {
+      placedTime,
+      confirmedDone,
+      confirmedTime,
+      shippedDone,
+      shippedTime,
+      outForDeliveryDone,
+      outForDeliveryTime,
+      deliveredDone,
+      deliveredTime,
+      estimatedDeliveryText,
+      courierDisplay,
+    });
+
     if (!liveTrackingUrl && trackingNumber) {
       liveTrackingUrl = `https://shiprocket.co/tracking/${encodeURIComponent(String(trackingNumber))}`;
+    }
+
+    const statusFromLifecycle = (() => {
+      // Cancellation/refund should override everything else.
+      if (displayStatus === "Cancelled" || displayStatus === "Refunded") return displayStatus;
+      if (shiprocketLifecycle) return shiprocketLifecycle;
+      if (trackingEnabled) return "Shipped";
+      if (shopifyShipped) return "Shipped";
+      if (confirmedDone) return "Confirmed";
+      return "Order Placed";
+    })();
+
+    const trackingMessage = (() => {
+      if (!trackingEnabled) return "Tracking will be available once your order is shipped";
+      if (trackingEnabled && shiprocketDelayed && !shiprocketAvailable) return "Tracking updates will be available shortly";
+      return null;
+    })();
+
+    const prevStatus = (() => {
+      const k = `${ORDER_STATUS_CACHE_PREFIX}${String(order.id || "")}`;
+      const prev = cache.get(k);
+      return prev?.status || null;
+    })();
+
+    if (statusFromLifecycle === "Delivered" && !shiprocketAvailable && prevStatus !== "Delivered") {
+      monitorAlert("invalid_delivered_without_shiprocket", {
+        orderId: order.id,
+        awbCode: trackingNumber,
+        shopifyStatus: { displayFulfillmentStatus: shopifyFulfillment || null, displayFinancialStatus: shopifyFinancial || null },
+      });
+    }
+
+    const finalStatus = lockOrderStatus({
+      orderId: order.id,
+      nextStatus: statusFromLifecycle,
+      meta: {
+        endpoint: "/api/order/:id/tracking",
+        reqId,
+        awbCode: trackingEnabled ? String(trackingNumber || "") : null,
+        shiprocketStatus: shiprocketAvailable ? shiprocketStatus : null,
+        shopifyStatus: { displayFulfillmentStatus: shopifyFulfillment || null, displayFinancialStatus: shopifyFinancial || null },
+      },
+    });
+    const lastUpdated = new Date().toISOString();
+
+    recordTrackingState({
+      orderId: order.id,
+      awbCode: trackingEnabled ? String(trackingNumber || "") : null,
+      trackingEnabled,
+      shiprocketAvailable,
+      shiprocketDelayed,
+      shiprocketStatus: shiprocketAvailable ? shiprocketStatus : null,
+      shopifyStatus: { displayFulfillmentStatus: shopifyFulfillment || null, displayFinancialStatus: shopifyFinancial || null },
+      displayStatus: finalStatus,
+      estimatedDeliveryText,
+      lastUpdated,
+      placedTime,
+      confirmedTime,
+      shippedTime,
+      outForDeliveryTime,
+      deliveredTime,
+      lastCarrierUpdateAt,
+    });
+
+    if (trackingEnabled && !String(trackingNumber || "").trim()) {
+      monitorAlert("invalid_state_missing_awb", { orderId: order.id, trackingEnabled: true });
+    }
+
+    if (trackingEnabled && shiprocketDelayed && !shiprocketAvailable) {
+      monitorLog("shiprocket_tracking_delayed", {
+        orderId: order.id,
+        awbCode: trackingNumber,
+        shopifyStatus: { displayFulfillmentStatus: shopifyFulfillment || null, displayFinancialStatus: shopifyFinancial || null },
+      });
+    }
+
+    const stuckHours = TRACKING_STUCK_HOURS > 0 ? TRACKING_STUCK_HOURS : 72;
+    const shippedAnchor = lastCarrierUpdateAt || shippedTime || confirmedTime || placedTime;
+    if (finalStatus === "Shipped" && shippedAnchor) {
+      const ageMs = Date.now() - new Date(shippedAnchor).getTime();
+      if (!Number.isNaN(ageMs) && ageMs > stuckHours * 60 * 60 * 1000) {
+        monitorAlert("shipment_stuck_no_update", {
+          orderId: order.id,
+          awbCode: trackingNumber,
+          shiprocketStatus: shiprocketAvailable ? shiprocketStatus : null,
+          shopifyStatus: { displayFulfillmentStatus: shopifyFulfillment || null, displayFinancialStatus: shopifyFinancial || null },
+          hoursSinceUpdate: Math.round(ageMs / (60 * 60 * 1000)),
+        });
+      }
     }
 
     return res.json({
       orderId: order.id,
       orderName: order.name,
       trackingNumber,
+      awbCode: trackingNumber,
       courier,
-      currentStatus,
+      currentStatus: finalStatus,
       estimatedDelivery,
-      displayStatus,
+      displayStatus: finalStatus,
+      trackingEnabled,
+      trackingMessage,
+      shiprocketStatus: shiprocketAvailable ? shiprocketStatus : null,
+      shiprocketAvailable: shiprocketAvailable,
+      shopifyStatus: {
+        displayFulfillmentStatus: shopifyFulfillment || null,
+        displayFinancialStatus: shopifyFinancial || null,
+      },
+      lastUpdated,
       timeline: [
         { step: "Order Placed", done: true, time: placedTime },
         { step: "Confirmed", done: Boolean(confirmedDone), time: confirmedTime },
         { step: "Shipped", done: Boolean(shippedDone), time: shippedTime },
-        { step: "Out for Delivery", done: Boolean(outForDeliveryDone), time: outForDeliveryTime },
+        { step: "Out for Delivery", done: Boolean(outForDeliveryDone || deliveredDone), time: outForDeliveryTime },
         { step: "Delivered", done: Boolean(deliveredDone), time: deliveredTime },
       ],
       trackingEvents,
@@ -1940,12 +2444,116 @@ app.get("/api/order/:id/tracking", async (req, res) => {
       courierDisplay,
     });
   } catch (err) {
-    console.error("Order Tracking Error:", err.response?.data || err.message);
+    const reqId = res.locals.reqId;
+    orderErr(`[${reqId}] tracking:error`, errorInfo(err));
+    console.error("Order Tracking Error:", errorInfo(err));
     const status = err?.response?.status;
     if (status === 401 || status === 403) {
       return res.status(502).json({ error: "Shopify Admin token is invalid" });
     }
     return res.status(500).json({ error: "Failed to fetch tracking" });
+  }
+});
+
+/* ------------------ ADMIN: TRACKING MONITORING ------------------ */
+
+app.get("/api/admin/tracking/issues", requireAdminMonitor, async (req, res) => {
+  try {
+    const now = Date.now();
+    const stuckHours = Number(req.query?.stuckHours || TRACKING_STUCK_HOURS || 72);
+    const thresholdMs = stuckHours * 60 * 60 * 1000;
+
+    const states = listTrackingStates();
+    const issues = [];
+
+    for (const s of states) {
+      const orderId = s?.orderId;
+      const awbCode = s?.awbCode || null;
+      const displayStatus = s?.displayStatus || null;
+      const shiprocketAvailable = s?.shiprocketAvailable === true;
+      const shiprocketDelayed = s?.shiprocketDelayed === true;
+      const shiprocketStatus = s?.shiprocketStatus || null;
+      const shopifyStatus = s?.shopifyStatus || null;
+      const trackingEnabled = s?.trackingEnabled === true;
+
+      const tags = [];
+
+      if (trackingEnabled && (!awbCode || !String(awbCode).trim())) tags.push("invalid_missing_awb");
+      if (trackingEnabled && shiprocketDelayed && !shiprocketAvailable) tags.push("shiprocket_delayed");
+
+      const shippedAnchor = s?.lastCarrierUpdateAt || s?.shippedTime || s?.confirmedTime || s?.placedTime || null;
+      if (displayStatus === "Shipped" && shippedAnchor) {
+        const ageMs = now - new Date(shippedAnchor).getTime();
+        if (!Number.isNaN(ageMs) && ageMs > thresholdMs) tags.push("stuck_shipped_no_update");
+      }
+
+      if (tags.length) {
+        issues.push({
+          orderId,
+          awbCode,
+          displayStatus,
+          shiprocketStatus,
+          shiprocketAvailable,
+          shopifyStatus,
+          trackingEnabled,
+          lastUpdated: s?.lastUpdated || null,
+          tags,
+        });
+      }
+    }
+
+    return res.json({ now: new Date().toISOString(), count: issues.length, issues });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to compute issues" });
+  }
+});
+
+app.get("/api/admin/tracking/metrics", requireAdminMonitor, async (req, res) => {
+  try {
+    const states = listTrackingStates();
+    const counts = {
+      total: states.length,
+      delivered: 0,
+      out_for_delivery: 0,
+      shipped: 0,
+      confirmed: 0,
+      cancelled: 0,
+      returned: 0,
+      delivery_failed: 0,
+    };
+
+    const deliveryDurationsHours = [];
+
+    for (const s of states) {
+      const st = String(s?.displayStatus || "").toLowerCase();
+      if (st === "delivered") counts.delivered += 1;
+      else if (st === "out for delivery") counts.out_for_delivery += 1;
+      else if (st === "shipped") counts.shipped += 1;
+      else if (st === "confirmed") counts.confirmed += 1;
+      else if (st === "cancelled") counts.cancelled += 1;
+      else if (st === "returned") counts.returned += 1;
+      else if (st === "delivery failed") counts.delivery_failed += 1;
+
+      const placed = s?.placedTime ? new Date(s.placedTime).getTime() : null;
+      const delivered = s?.deliveredTime ? new Date(s.deliveredTime).getTime() : null;
+      if (placed && delivered && !Number.isNaN(placed) && !Number.isNaN(delivered) && delivered >= placed) {
+        deliveryDurationsHours.push((delivered - placed) / (60 * 60 * 1000));
+      }
+    }
+
+    const avgDeliveryHours =
+      deliveryDurationsHours.length
+        ? deliveryDurationsHours.reduce((a, b) => a + b, 0) / deliveryDurationsHours.length
+        : null;
+
+    return res.json({
+      now: new Date().toISOString(),
+      counts,
+      avgDeliveryHours,
+      deliveredSampleSize: deliveryDurationsHours.length,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to compute metrics" });
   }
 });
 
@@ -2003,14 +2611,16 @@ app.get("/api/products/:id", async (req, res) => {
 
     // 🔥 Handle GraphQL errors safely
     if (!response.data.data || !response.data.data.product) {
-      console.error("GraphQL Error:", response.data);
+      console.error("GraphQL Error:", {
+        message: response?.data?.errors?.[0]?.message || "Unknown GraphQL error",
+      });
       return res.status(500).json({});
     }
 
     res.json(response.data.data.product);
 
   } catch (err) {
-    console.error("Product Fetch Error:", err.response?.data || err.message);
+    console.error("Product Fetch Error:", errorInfo(err));
     res.status(500).json({});
   }
 });
@@ -2037,7 +2647,7 @@ app.get("/api/shopify/collections", async (req, res) => {
     res.json(collections);
 
   } catch (err) {
-    console.error("Collections Error:", err.response?.data || err.message);
+    console.error("Collections Error:", errorInfo(err));
     res.status(500).json([]);
   }
 });
@@ -2281,7 +2891,7 @@ app.post("/api/payment/verify", async (req, res) => {
     });
 
   } catch (err) {
-  console.error("FULL ERROR:", err);
+  console.error("FULL ERROR:", errorInfo(err));
   res.json({ success: false, message: err.message });
 } 
 });
@@ -2314,7 +2924,6 @@ async function startServer() {
       console.log("✅ Logo found at:", foundLogo);
     } else {
       console.warn("⚠️  Logo not found. Place logo.png in assets/ folder.");
-      console.warn("Searched paths:", logoCandidates);
     }
 
     app.listen(PORT, () => {
@@ -2323,7 +2932,7 @@ async function startServer() {
 
   } catch (error) {
     console.error("MongoDB connection failed ❌");
-    console.error(error);
+    console.error(errorInfo(error));
     process.exit(1);
   }
 }
