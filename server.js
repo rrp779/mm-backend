@@ -1794,7 +1794,7 @@ app.get("/api/shopify/search", async (req, res) => {
     res.json([]);
 
   } catch (err) {
-    console.error("GraphQL Search Error:", errorInfo(err));
+    console.error("GraphQL Search Error:", err.response?.data || err.message);
     res.status(500).json([]);
   }
 });
