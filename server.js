@@ -1725,6 +1725,9 @@ app.get("/api/shopify/best-selling", async (req, res) => {
 app.get("/api/shopify/search", async (req, res) => {
   const { type = "product", q = "" } = req.query;
 
+  console.log("SHOPIFY_STORE:", process.env.SHOPIFY_STORE);
+console.log("SHOPIFY_ADMIN_TOKEN:", process.env.SHOPIFY_ADMIN_TOKEN ? "EXISTS" : "MISSING"); 
+
   if (!q) return res.json([]);
 
   try {
