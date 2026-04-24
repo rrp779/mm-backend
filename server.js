@@ -1537,11 +1537,11 @@ app.get("/api/shopify/search", async (req, res) => {
 
     const cached = cache.get(cacheKey);
     if (cached) {
-      // cache hit
+      console.log("⚡ SEARCH CACHE HIT");
       return res.json(cached);
     }
 
-    // api hit
+    console.log("🐢 SEARCH API HIT");
 
     const query = `
     {
