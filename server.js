@@ -1260,43 +1260,6 @@ function buildInvoicePdfBuffer(order) {
   return done;
 }
 
-
-
-app.delete("/api/customer/delete", async (req, res) => {
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ error: "Email is required" });
-    }
-
-    // 🔴 1. Find Shopify customer
-    const customerId = await getShopifyCustomerIdByEmail(email);
-
-    if (!customerId) {
-      return res.status(404).json({ error: "Customer not found" });
-    }
-
-    // 🔴 2. Delete from Shopify
-    await axios.delete(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/${customerId}.json`,
-      {
-        headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-        },
-      }
-    );
-
-    // 🔴 3. (Optional) Delete from your DB if you store users
-    // await Customer.deleteOne({ email });
-
-    res.json({ success: true });
-
-  } catch (err) {
-    console.error("Delete Account Error:", err.response?.data || err.message);
-    res.status(500).json({ error: "Failed to delete account" });
-  }
-});
  
 /* ------------------ SCHEMA ------------------ */
 const SectionSchema = new mongoose.Schema({
