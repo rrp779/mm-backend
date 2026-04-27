@@ -183,6 +183,147 @@ function toNumericId(gid) {
   return parseInt(str);
 }
 
+const BUNDLE_ANY3_QTY = Number(process.env.BUNDLE_ANY3_QTY || 3);
+const BUNDLE_ANY3_PRICE = Number(process.env.BUNDLE_ANY3_PRICE || 1500);
+const BUNDLE_ANY3_COLLECTION_TITLE = String(
+  process.env.BUNDLE_ANY3_COLLECTION_TITLE || "Any 3 at ₹1500"
+).trim();
+const BUNDLE_ANY3_COLLECTION_HANDLE = String(
+  process.env.BUNDLE_ANY3_COLLECTION_HANDLE || ""
+)
+  .trim()
+  .toLowerCase();
+
+function normalizeVariantGid(variantId) {
+  if (!variantId) return null;
+  const str = String(variantId).trim();
+  if (str.startsWith("gid://")) return str;
+  const n = toNumericId(str);
+  if (!n || Number.isNaN(n)) return null;
+  return `gid://shopify/ProductVariant/${n}`;
+}
+
+function isAny3BundleCollection(c) {
+  if (!c) return false;
+  const handle = String(c.handle || "").trim().toLowerCase();
+  const title = String(c.title || "").trim().toLowerCase();
+
+  if (BUNDLE_ANY3_COLLECTION_HANDLE && handle === BUNDLE_ANY3_COLLECTION_HANDLE) {
+    return true;
+  }
+
+  const configuredTitle = String(BUNDLE_ANY3_COLLECTION_TITLE || "")
+    .trim()
+    .toLowerCase();
+  if (configuredTitle && title === configuredTitle) return true;
+
+  // fallback heuristic
+  return title.includes("any 3") && (title.includes("1500") || title.includes("1,500"));
+}
+
+async function fetchVariantEligibility(variantGids) {
+  const ids = Array.isArray(variantGids)
+    ? [...new Set(variantGids.map(normalizeVariantGid).filter(Boolean))]
+    : [];
+
+  if (ids.length === 0) return new Map();
+
+  const resp = await axios.post(
+    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
+    {
+      query: `
+        query VariantCollections($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on ProductVariant {
+              id
+              product {
+                collections(first: 20) {
+                  edges { node { id title handle } }
+                }
+              }
+            }
+          }
+        }
+      `,
+      variables: { ids },
+    },
+    {
+      headers: {
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
+    }
+  );
+
+  const nodes = resp?.data?.data?.nodes || [];
+  const out = new Map();
+
+  for (const n of nodes) {
+    if (!n || !n.id) continue;
+    const edges = n?.product?.collections?.edges || [];
+    const eligible = Array.isArray(edges)
+      ? edges.some((e) => isAny3BundleCollection(e?.node))
+      : false;
+    out.set(String(n.id), !!eligible);
+  }
+
+  return out;
+}
+
+async function computeAny3BundleDiscount(cart) {
+  if (!Array.isArray(cart) || cart.length === 0) {
+    return { discount: 0, bundles: 0, eligibleQty: 0 };
+  }
+
+  if (!Number.isFinite(BUNDLE_ANY3_QTY) || BUNDLE_ANY3_QTY <= 0) {
+    return { discount: 0, bundles: 0, eligibleQty: 0 };
+  }
+
+  if (!Number.isFinite(BUNDLE_ANY3_PRICE) || BUNDLE_ANY3_PRICE <= 0) {
+    return { discount: 0, bundles: 0, eligibleQty: 0 };
+  }
+
+  const variantIds = cart
+    .map((i) => normalizeVariantGid(i?.variant_id))
+    .filter(Boolean);
+  const eligibility = await fetchVariantEligibility(variantIds);
+
+  const eligibleItems = [];
+  for (const item of cart) {
+    const gid = normalizeVariantGid(item?.variant_id);
+    if (!gid) continue;
+    if (!eligibility.get(gid)) continue;
+
+    const unitPrice = Number(item?.price || 0);
+    const qty = Number(item?.quantity || 1);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) continue;
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+
+    eligibleItems.push({ gid, unitPrice, qty });
+  }
+
+  const eligibleQty = eligibleItems.reduce((sum, i) => sum + i.qty, 0);
+  const bundles = Math.floor(eligibleQty / BUNDLE_ANY3_QTY);
+  if (bundles <= 0) return { discount: 0, bundles: 0, eligibleQty };
+
+  let remainingDiscountUnits = bundles * BUNDLE_ANY3_QTY;
+  eligibleItems.sort((a, b) => b.unitPrice - a.unitPrice);
+
+  let discountedUnitsPriceTotal = 0;
+  for (const i of eligibleItems) {
+    if (remainingDiscountUnits <= 0) break;
+    const discountedQty = Math.min(i.qty, remainingDiscountUnits);
+    remainingDiscountUnits -= discountedQty;
+    discountedUnitsPriceTotal += discountedQty * i.unitPrice;
+  }
+
+  const target = bundles * BUNDLE_ANY3_PRICE;
+  const discount = Math.max(0, discountedUnitsPriceTotal - target);
+
+  return { discount, bundles, eligibleQty };
+}
+
 async function getShopifyCustomerIdByEmail(email) {
   if (!email) return null;
   const query = encodeURIComponent(`email:${String(email).trim()}`);
@@ -621,6 +762,9 @@ async function fetchOrderForInvoice(orderGid) {
     .replace("gid://shopify/Order/", "")
     .split("?")[0]
     .trim();
+  const graphOrderId = String(orderGid || "").includes("gid://shopify/Order/")
+    ? String(orderGid).split("?")[0].trim()
+    : `gid://shopify/Order/${numericId}`;
 
   orderLog("[invoice] shopify:request", { orderGid: String(orderGid), numericId });
 
@@ -652,26 +796,140 @@ async function fetchOrderForInvoice(orderGid) {
 
   if (!order) return null;
 
+  const debugInvoice = String(process.env.DEBUG_INVOICE || "").trim() === "1";
+  if (debugInvoice) {
+    console.log("billing_address:", JSON.stringify(order.billing_address));
+    console.log("shipping_address:", JSON.stringify(order.shipping_address));
+  }
+
+  // Shopify REST order responses sometimes omit address PII (name/address1/phone) while the Admin GraphQL
+  // order query still returns the full address. Fetch addresses via GraphQL and use them as the source of truth.
+  let graphOrder = null;
+  try {
+    const graphResp = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
+      {
+        query: `
+          query OrderInvoiceAddresses($id: ID!) {
+            order(id: $id) {
+              id
+              email
+              phone
+              customer {
+                firstName
+                lastName
+                email
+                phone
+              }
+              billingAddress {
+                name
+                firstName
+                lastName
+                address1
+                address2
+                city
+                province
+                country
+                zip
+                phone
+              }
+              shippingAddress {
+                name
+                firstName
+                lastName
+                address1
+                address2
+                city
+                province
+                country
+                zip
+                phone
+              }
+            }
+          }
+        `,
+        variables: { id: graphOrderId },
+      },
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+        timeout: 10000,
+      }
+    );
+
+    const data = graphResp?.data;
+    if (data?.errors?.length) {
+      orderLog("[invoice] shopify_graphql:error", { errors: data.errors });
+    } else {
+      graphOrder = data?.data?.order || null;
+      if (!graphOrder) {
+        orderLog("[invoice] shopify_graphql:missing_order", { orderGid: String(orderGid), graphOrderId });
+      }
+    }
+  } catch (e) {
+    orderLog("[invoice] shopify_graphql:exception", { message: e?.message || String(e) });
+  }
+
+  if (debugInvoice && graphOrder) {
+    console.log("billingAddress(GraphQL):", JSON.stringify(graphOrder.billingAddress));
+    console.log("shippingAddress(GraphQL):", JSON.stringify(graphOrder.shippingAddress));
+  }
+
   const noteAttrs = {};
   (order.note_attributes || []).forEach((attr) => {
     if (!attr?.name) return;
     noteAttrs[attr.name] = attr.value;
   });
 
-  const nameFromParts = (obj) => {
-    const first = String(obj?.first_name || "").trim();
-    const last = String(obj?.last_name || "").trim();
-    const combined = [first, last].filter(Boolean).join(" ").trim();
-    return combined;
+  const strOrEmpty = (v) => String(v || "").trim();
+
+  const pickStr = (obj, keys) => {
+    for (const key of keys) {
+      const val = strOrEmpty(obj?.[key]);
+      if (val) return val;
+    }
+    return "";
   };
 
+  const pickStrFrom = (objs, keys) => {
+    for (const obj of objs) {
+      const val = pickStr(obj, keys);
+      if (val) return val;
+    }
+    return "";
+  };
+
+  const nameFromParts = (obj) => {
+    const name = pickStr(obj, ["name"]);
+    if (name) return name;
+
+    const first = pickStr(obj, ["first_name", "firstName"]);
+    const last = pickStr(obj, ["last_name", "lastName"]);
+    return [first, last].filter(Boolean).join(" ").trim();
+  };
+
+  const billingRaw =
+    graphOrder?.billingAddress ||
+    order.billing_address ||
+    order.billingAddress ||
+    {};
+  const shippingRaw =
+    graphOrder?.shippingAddress ||
+    order.shipping_address ||
+    order.shippingAddress ||
+    {};
+
   const customerName =
+    nameFromParts(graphOrder?.customer) ||
     nameFromParts(order.customer) ||
-    nameFromParts(order.billing_address) ||
-    nameFromParts(order.shipping_address) ||
+    nameFromParts(billingRaw) ||
+    nameFromParts(shippingRaw) ||
     "Customer";
 
   const customerEmail =
+    graphOrder?.email ||
+    graphOrder?.customer?.email ||
     order.email ||
     order.contact_email ||
     order.customer?.email ||
@@ -679,34 +937,44 @@ async function fetchOrderForInvoice(orderGid) {
 
   const customerPhone =
     noteAttrs["Customer Phone"] ||
-    order.billing_address?.phone ||
-    order.shipping_address?.phone ||
+    billingRaw?.phone ||
+    shippingRaw?.phone ||
+    graphOrder?.phone ||
+    graphOrder?.customer?.phone ||
     order.customer?.phone ||
     "";
 
-  const billingName = nameFromParts(order.billing_address);
-  const shippingName = nameFromParts(order.shipping_address);
+  // Some Shopify orders (esp. certain payment flows) may have an empty billing_address even though
+  // shipping_address is populated. For invoices, fall back to whichever address has data.
+  const billingName =
+    nameFromParts(billingRaw) ||
+    nameFromParts(shippingRaw) ||
+    customerName;
+  const shippingName =
+    nameFromParts(shippingRaw) ||
+    nameFromParts(billingRaw) ||
+    customerName;
 
   const billingAddress = {
     name: billingName,
-    address1: order.billing_address?.address1 || "",
-    address2: order.billing_address?.address2 || "",
-    city: order.billing_address?.city || "",
-    province: order.billing_address?.province || "",
-    country: order.billing_address?.country || "",
-    zip: order.billing_address?.zip || "",
-    phone: order.billing_address?.phone || customerPhone,
+    address1: pickStrFrom([billingRaw, shippingRaw], ["address1"]) || "",
+    address2: pickStrFrom([billingRaw, shippingRaw], ["address2"]) || "",
+    city: pickStrFrom([billingRaw, shippingRaw], ["city"]) || "",
+    province: pickStrFrom([billingRaw, shippingRaw], ["province"]) || "",
+    country: pickStrFrom([billingRaw, shippingRaw], ["country"]) || "",
+    zip: pickStrFrom([billingRaw, shippingRaw], ["zip"]) || "",
+    phone: pickStrFrom([billingRaw, shippingRaw], ["phone"]) || customerPhone,
   };
 
   const shippingAddress = {
     name: shippingName,
-    address1: order.shipping_address?.address1 || "",
-    address2: order.shipping_address?.address2 || "",
-    city: order.shipping_address?.city || "",
-    province: order.shipping_address?.province || "",
-    country: order.shipping_address?.country || "",
-    zip: order.shipping_address?.zip || "",
-    phone: customerPhone,
+    address1: pickStrFrom([shippingRaw, billingRaw], ["address1"]) || "",
+    address2: pickStrFrom([shippingRaw, billingRaw], ["address2"]) || "",
+    city: pickStrFrom([shippingRaw, billingRaw], ["city"]) || "",
+    province: pickStrFrom([shippingRaw, billingRaw], ["province"]) || "",
+    country: pickStrFrom([shippingRaw, billingRaw], ["country"]) || "",
+    zip: pickStrFrom([shippingRaw, billingRaw], ["zip"]) || "",
+    phone: pickStrFrom([shippingRaw, billingRaw], ["phone"]) || customerPhone,
   };
 
   const currency = order.currency || "INR";
@@ -1537,11 +1805,11 @@ app.get("/api/shopify/search", async (req, res) => {
 
     const cached = cache.get(cacheKey);
     if (cached) {
-      console.log("⚡ SEARCH CACHE HIT");
+      // cache hit
       return res.json(cached);
     }
 
-    console.log("🐢 SEARCH API HIT");
+    // api hit
 
     const query = `
     {
@@ -1725,9 +1993,6 @@ app.get("/api/shopify/best-selling", async (req, res) => {
 app.get("/api/shopify/search", async (req, res) => {
   const { type = "product", q = "" } = req.query;
 
-  console.log("SHOPIFY_STORE:", process.env.SHOPIFY_STORE);
-console.log("SHOPIFY_ADMIN_TOKEN:", process.env.SHOPIFY_ADMIN_TOKEN ? "EXISTS" : "MISSING"); 
-
   if (!q) return res.json([]);
 
   try {
@@ -1797,7 +2062,7 @@ console.log("SHOPIFY_ADMIN_TOKEN:", process.env.SHOPIFY_ADMIN_TOKEN ? "EXISTS" :
     res.json([]);
 
   } catch (err) {
-    console.error("GraphQL Search Error:", err.response?.data || err.message);
+    console.error("GraphQL Search Error:", errorInfo(err));
     res.status(500).json([]);
   }
 });
@@ -2701,8 +2966,11 @@ app.post("/api/payment/verify", async (req, res) => {
       email,
       phone,
       address1,
+      address2,
       city,
       state,
+      province,
+      country,
       pincode,
       amount,
       couponCode,
@@ -2744,17 +3012,34 @@ app.post("/api/payment/verify", async (req, res) => {
         }
       : calculateShipping(cartSubtotal, false);
 
-    const couponDisc = Math.max(0, Number(couponDiscount || 0));
-    const orderTotal = Math.max(0, cartSubtotal + Number(finalShipping.price) - couponDisc);
+    const bundleInfo = await computeAny3BundleDiscount(cart);
+    const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
 
-    // Only add discount_codes if coupon applied
-    const discountCodesPayload = (couponCode && Number(couponDiscount) > 0)
-      ? [{
-          code: String(couponCode),
-          amount: Number(couponDiscount).toFixed(2),
-          type: "fixed_amount",
-        }]
-      : [];
+    const couponDisc = Math.max(0, Number(couponDiscount || 0));
+    const orderTotal = Math.max(
+      0,
+      cartSubtotal + Number(finalShipping.price) - couponDisc - bundleDisc
+    );
+
+    const discountCodesPayload = [];
+
+    // Add coupon discount if applied
+    if (couponCode && Number(couponDiscount) > 0) {
+      discountCodesPayload.push({
+        code: String(couponCode),
+        amount: Number(couponDiscount).toFixed(2),
+        type: "fixed_amount",
+      });
+    }
+
+    // Add automatic bundle discount (for Shopify order totals)
+    if (bundleDisc > 0) {
+      discountCodesPayload.push({
+        code: "AUTO_BUNDLE_ANY3_1500",
+        amount: bundleDisc.toFixed(2),
+        type: "fixed_amount",
+      });
+    }
 
     /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
 
@@ -2803,9 +3088,10 @@ app.post("/api/payment/verify", async (req, res) => {
     first_name,
     last_name,
     address1,
+    address2,
     city,
-    province: state,
-    country: "India",
+    province: province || state,
+    country: country || "India",
     zip: pincode,
     phone,
   },
@@ -2814,9 +3100,10 @@ app.post("/api/payment/verify", async (req, res) => {
     first_name,
     last_name,
     address1,
+    address2,
     city,
-    province: state,
-    country: "India",
+    province: province || state,
+    country: country || "India",
     zip: pincode,
     phone,
   },
@@ -2856,6 +3143,10 @@ app.post("/api/payment/verify", async (req, res) => {
     ...(couponCode ? [
       { name: "Coupon Code", value: String(couponCode) },
       { name: "Coupon Discount", value: String(couponDiscount || 0) },
+    ] : []),
+    ...(bundleDisc > 0 ? [
+      { name: "Bundle Discount", value: String(bundleDisc.toFixed(2)) },
+      { name: "Bundle Offer", value: `Any ${BUNDLE_ANY3_QTY} @ ${BUNDLE_ANY3_PRICE}` },
     ] : []),
     { name: "Shipping Amount", value: String(finalShipping.price) },
     { name: "Final Payable", value: String(orderTotal.toFixed(2)) },
