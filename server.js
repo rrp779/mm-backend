@@ -1,4 +1,6 @@
-require("dotenv").config();
+// Always load env from this folder (works even if started from repo root).
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 
  
 
@@ -6,9 +8,9 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer");
-const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
+const dns = require("dns");
 
 const app = express();
 
@@ -20,9 +22,17 @@ const NodeCache = require("node-cache");
 const cache = new NodeCache({ stdTTL: 60 });  
 const Review = require("./models/Review");
 
+const RAZORPAY_KEY_ID = String(process.env.RAZORPAY_KEY_ID || "").trim();
+const RAZORPAY_KEY_SECRET = String(process.env.RAZORPAY_KEY_SECRET || "").trim();
+if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+  throw new Error(
+    "Missing Razorpay credentials. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in mm-backend/.env (copy from .env.example)."
+  );
+}
+
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
+  key_id: RAZORPAY_KEY_ID,
+  key_secret: RAZORPAY_KEY_SECRET,
 });
 
 const SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket_jwt";
@@ -141,6 +151,33 @@ function errorInfo(err) {
   const code = err?.code;
   const message = err?.message ? String(err.message) : String(err || "");
   return { message, status: status ?? null, code: code ?? null };
+}
+
+function normalizePhoneE164(phone, defaultCountry = "IN") {
+  const raw = String(phone ?? "").trim();
+  if (!raw) return null;
+
+  // Keep only digits and leading +
+  let cleaned = raw.replace(/[^\d+]/g, "");
+
+  // Convert 00 prefix to +
+  if (cleaned.startsWith("00")) cleaned = `+${cleaned.slice(2)}`;
+
+  if (cleaned.startsWith("+")) {
+    const digits = cleaned.slice(1).replace(/\D/g, "");
+    if (digits.length < 10 || digits.length > 15) return null;
+    return `+${digits}`;
+  }
+
+  const digits = cleaned.replace(/\D/g, "");
+  if (defaultCountry === "IN") {
+    if (digits.length === 10) return `+91${digits}`;
+    if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
+  }
+
+  // Fallback: accept 10-15 digits without country code by prefixing +
+  if (digits.length >= 10 && digits.length <= 15) return `+${digits}`;
+  return null;
 }
 
 function parseBoolQuery(value) {
@@ -1640,7 +1677,7 @@ app.get("/api/sections", async (req, res) => {
 
   } catch (err) {
     console.error("Sections fetch error:", err);
-    res.status(500).json([]);
+    res.status(500).json({ error: "Failed to load sections", details: err.message });
   }
 });
 
@@ -1748,7 +1785,7 @@ app.get("/api/products/:id", async (req, res) => {
 
   } catch (err) {
     console.error("Product error:", err.message);
-    res.status(500).json({});
+    res.status(500).json({ error: "Product fetch failed", details: err.message });
   }
 });
 
@@ -2070,19 +2107,33 @@ app.get("/api/shopify/search", async (req, res) => {
 
 /* ------------------ SHOPIFY COUPONS ------------------ */
 
+function getNextShopifyLink(linkHeader) {
+  const header = String(linkHeader || "").trim();
+  if (!header) return null;
+  const parts = header.split(",");
+  for (const part of parts) {
+    const seg = part.trim();
+    if (!seg.includes('rel="next"')) continue;
+    const m = seg.match(/<([^>]+)>/);
+    return m?.[1] || null;
+  }
+  return null;
+}
+
 app.get("/api/shopify/coupons", async (req, res) => {
   try {
 
-    const priceRulesResponse = await axios.get(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules.json`,
-      {
+    const rules = [];
+    let nextUrl = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules.json?limit=250`;
+    for (let page = 0; page < 20 && nextUrl; page++) {
+      const resp = await axios.get(nextUrl, {
         headers: {
           "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
         },
-      }
-    );
-
-    const rules = priceRulesResponse.data.price_rules || [];
+      });
+      rules.push(...(resp.data.price_rules || []));
+      nextUrl = getNextShopifyLink(resp.headers?.link);
+    }
 
     let coupons = [];
     const now = new Date();
@@ -2102,7 +2153,7 @@ app.get("/api/shopify/coupons", async (req, res) => {
       if (!Number.isFinite(valueNumber) || valueNumber <= 0) continue;
 
       const codesResponse = await axios.get(
-        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules/${rule.id}/discount_codes.json`,
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules/${rule.id}/discount_codes.json?limit=250`,
         {
           headers: {
             "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
@@ -2923,6 +2974,13 @@ app.get("/api/shopify/collections", async (req, res) => {
 
 /* ------------------ CREATE PAYMENT ORDER ------------------ */
 
+// Public config needed by mobile app (safe to expose key_id).
+app.get("/api/payment/config", (req, res) => {
+  res.json({
+    key_id: String(process.env.RAZORPAY_KEY_ID || "").trim(),
+  });
+});
+
 app.post("/api/payment/create-order", async (req, res) => {
   try {
     const { amount, cart, email, phone } = req.body;
@@ -3063,6 +3121,7 @@ app.post("/api/payment/verify", async (req, res) => {
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
 
     const shopifyCustomerId = await getShopifyCustomerIdByEmail(email);
+    const normalizedPhone = normalizePhoneE164(phone, "IN");
 
     const shopifyOrder = await axios.post(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
@@ -3079,7 +3138,7 @@ app.post("/api/payment/verify", async (req, res) => {
     first_name,
     last_name,
     email,
-    phone,
+    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
   },
 
   email,
@@ -3093,7 +3152,7 @@ app.post("/api/payment/verify", async (req, res) => {
     province: province || state,
     country: country || "India",
     zip: pincode,
-    phone,
+    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
   },
 
   shipping_address: {
@@ -3105,7 +3164,7 @@ app.post("/api/payment/verify", async (req, res) => {
     province: province || state,
     country: country || "India",
     zip: pincode,
-    phone,
+    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
   },
 
   shipping_lines: [
@@ -3138,7 +3197,7 @@ app.post("/api/payment/verify", async (req, res) => {
   note_attributes: [
     { name: "Payment ID", value: razorpay_payment_id },
     { name: "Order ID", value: razorpay_order_id },
-    { name: "Customer Phone", value: phone },
+    { name: "Customer Phone", value: normalizedPhone || String(phone || "") },
     { name: "Receipt", value: razorpayOrder.receipt },
     ...(couponCode ? [
       { name: "Coupon Code", value: String(couponCode) },
@@ -3185,19 +3244,87 @@ app.post("/api/payment/verify", async (req, res) => {
     });
 
   } catch (err) {
-  console.error("FULL ERROR:", errorInfo(err));
-  res.json({ success: false, message: err.message });
-} 
+    const info = errorInfo(err);
+    const shopifyStatus = err?.response?.status ?? null;
+    const shopifyData = err?.response?.data ?? null;
+
+    console.error("FULL ERROR:", info);
+    if (shopifyStatus || shopifyData) {
+      console.error("SHOPIFY ERROR DETAILS:", {
+        status: shopifyStatus,
+        data: shopifyData,
+      });
+    }
+
+    const details =
+      shopifyData?.errors ||
+      shopifyData?.error ||
+      shopifyData ||
+      null;
+
+    res.json({
+      success: false,
+      message: info.message || "Order creation failed",
+      details,
+    });
+  } 
 });
 
  
 
 /* ------------------ START SERVER ------------------ */
 
+function getMongoHostname(mongoUri) {
+  try {
+    return new URL(String(mongoUri)).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+async function preflightMongoSrvLookup(mongoUri) {
+  const uri = String(mongoUri || "").trim();
+  if (!uri || !uri.startsWith("mongodb+srv://")) return;
+
+  const host = getMongoHostname(uri);
+  if (!host) return;
+
+  const srvRecord = `_mongodb._tcp.${host}`;
+
+  const override = String(process.env.MONGO_DNS_SERVERS || "").trim();
+  if (override) {
+    const servers = override
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (servers.length) dns.setServers(servers);
+  }
+
+  try {
+    await dns.promises.resolveSrv(srvRecord);
+  } catch (err) {
+    const code = err?.code;
+    if (code === "ECONNREFUSED" || code === "ETIMEOUT") {
+      const hint =
+        "MongoDB SRV DNS lookup failed from Node. This usually means your DNS server/network is refusing SRV queries.\n" +
+        `SRV record: ${srvRecord}\n` +
+        "Fix options:\n" +
+        "- Set MONGO_DNS_SERVERS=1.1.1.1,8.8.8.8 (or your trusted DNS servers)\n" +
+        "- Or change MONGO_URI to a non-SRV mongodb:// connection string (comma-separated hosts)\n";
+      const e = new Error(hint);
+      e.code = "MONGO_SRV_DNS";
+      e.cause = err;
+      throw e;
+    }
+    throw err;
+  }
+}
+
 async function startServer() {
   try {
     
     
+    await preflightMongoSrvLookup(process.env.MONGO_URI);
     await mongoose.connect(process.env.MONGO_URI);
 
     console.log("MongoDB Atlas connected ✅");
@@ -3220,8 +3347,19 @@ async function startServer() {
       console.warn("⚠️  Logo not found. Place logo.png in assets/ folder.");
     }
 
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`Server running on port ${PORT} 🚀`);
+    });
+
+    server.on("error", (err) => {
+      if (err && err.code === "EADDRINUSE") {
+        console.error(
+          `Port ${PORT} is already in use (EADDRINUSE). Stop the other process or change PORT in mm-backend/.env.`
+        );
+        process.exit(1);
+      }
+      console.error("Server failed to start:", errorInfo(err));
+      process.exit(1);
     });
 
   } catch (error) {
