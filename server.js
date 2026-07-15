@@ -473,14 +473,20 @@ async function createOtpCustomer({ phone, firstName, lastName }) {
         password,
         phone,
         firstName: firstName || "Customer",
-        lastName: lastName || "",
+        lastName: lastName || "Customer",
       },
     }
   );
 
   const errors = data?.customerCreate?.customerUserErrors || [];
-  if (errors.length && !String(errors[0]?.message || "").toLowerCase().includes("already")) {
-    throw new Error(errors[0]?.message || "Unable to create customer");
+  if (errors.length) {
+    const errMsg = String(errors[0]?.message || "");
+    if (errMsg.toLowerCase().includes("phone") && errMsg.toLowerCase().includes("taken")) {
+      throw new Error("This phone number is already registered to an email account. Please log in using your email and password.");
+    }
+    if (!errMsg.toLowerCase().includes("already")) {
+      throw new Error(errMsg || "Unable to create customer");
+    }
   }
 
   return { email, password };
@@ -516,10 +522,130 @@ async function loginOtpCustomer(phone) {
   return token;
 }
 
+async function getShopifyCustomerByPhone(phone) {
+  if (!phone) return null;
+  
+  try {
+    const query = encodeURIComponent(`phone:${phone.trim()}`);
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    if (response?.data?.customers?.[0]) {
+      return response.data.customers[0];
+    }
+  } catch (err) {
+    console.error("Search customer by E164 phone failed:", err.message);
+  }
+
+  try {
+    const digitsOnly = phone.replace(/\D/g, "");
+    const query = encodeURIComponent(`phone:${digitsOnly}`);
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    if (response?.data?.customers?.[0]) {
+      return response.data.customers[0];
+    }
+  } catch (err) {
+    console.error("Search customer by digits phone failed:", err.message);
+  }
+
+  try {
+    const digitsOnly = phone.replace(/\D/g, "");
+    if (digitsOnly.length > 10) {
+      const tenDigits = digitsOnly.substring(digitsOnly.length - 10);
+      const query = encodeURIComponent(`phone:${tenDigits}`);
+      const response = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+      if (response?.data?.customers?.[0]) {
+        return response.data.customers[0];
+      }
+    }
+  } catch (err) {
+    console.error("Search customer by 10-digit phone failed:", err.message);
+  }
+
+  return null;
+}
+
+async function updateShopifyCustomerPassword(customerId, newPassword) {
+  await axios.put(
+    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/${customerId}.json`,
+    {
+      customer: {
+        id: customerId,
+        password: newPassword,
+        password_confirmation: newPassword,
+      },
+    },
+    {
+      headers: {
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+    }
+  );
+}
+
+async function loginOtpCustomerWithRealEmail(email, phone) {
+  const password = makeOtpCustomerPassword(phone);
+
+  const data = await shopifyStorefrontRequest(
+    `
+      mutation LoginOtpCustomer($input: CustomerAccessTokenCreateInput!) {
+        customerAccessTokenCreate(input: $input) {
+          customerAccessToken {
+            accessToken
+            expiresAt
+          }
+          customerUserErrors { message }
+        }
+      }
+    `,
+    {
+      input: { email, password },
+    }
+  );
+
+  const errors = data?.customerAccessTokenCreate?.customerUserErrors || [];
+  const token = data?.customerAccessTokenCreate?.customerAccessToken;
+  if (errors.length || !token) {
+    throw new Error(errors[0]?.message || "Unable to login customer");
+  }
+
+  return token;
+}
+
 async function getOrCreateOtpCustomerToken({ phone, firstName, lastName }) {
   try {
     return await loginOtpCustomer(phone);
   } catch (_) {
+    // Check if the phone is registered to an existing customer account!
+    const existingCustomer = await getShopifyCustomerByPhone(phone);
+    if (existingCustomer) {
+      if (!existingCustomer.email) {
+        throw new Error("Shopify has redacted the email for this customer. Please go to your Shopify Admin -> Develop Apps -> Select your app -> API Integration, and request/enable access to 'Protected Customer Data' so the app can link WhatsApp logins to email accounts.");
+      }
+      const password = makeOtpCustomerPassword(phone);
+      await updateShopifyCustomerPassword(existingCustomer.id, password);
+      return await loginOtpCustomerWithRealEmail(existingCustomer.email, phone);
+    }
+
     await createOtpCustomer({ phone, firstName, lastName });
     return await loginOtpCustomer(phone);
   }
@@ -3247,9 +3373,8 @@ app.post("/api/auth/whatsapp/verify-otp", async (req, res) => {
       return res.status(400).json({ success: false, message: "Incorrect OTP" });
     }
 
-    cache.del(otpCacheKey(phone));
-
     if (verifyOnly) {
+      cache.del(otpCacheKey(phone));
       return res.json({
         success: true,
         phone,
@@ -3258,6 +3383,8 @@ app.post("/api/auth/whatsapp/verify-otp", async (req, res) => {
     }
 
     const token = await getOrCreateOtpCustomerToken({ phone, firstName, lastName });
+
+    cache.del(otpCacheKey(phone));
 
     return res.json({
       success: true,
@@ -3273,7 +3400,7 @@ app.post("/api/auth/whatsapp/verify-otp", async (req, res) => {
     if (err?.response?.data) console.error("Shopify OTP customer error details:", err.response.data);
     return res.status(500).json({
       success: false,
-      message: "Unable to verify WhatsApp OTP",
+      message: err.message || "Unable to verify WhatsApp OTP",
       details: err?.response?.data || null,
     });
   }
