@@ -1,0 +1,27 @@
+# Server
+PORT=5500
+MONGO_URI=mongodb+srv://ritesh_db_user:AswsLk1lm6LGJ3L4@mm-mobile-app.3knifbd.mongodb.net/?appName=mm-mobile-app
+SHOPIFY_STORE=makeup-mystery-india.myshopify.com
+SHOPIFY_ADMIN_TOKEN=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
+SHOPIFY_STOREFRONT_TOKEN=6d1ee35c574a5b42ea8abafcb1e8f3e5
+MONGO_DNS_SERVERS=1.1.1.1,8.8.8.8
+# Reviews
+REQUIRE_PURCHASED_REVIEW=true
+
+RAZORPAY_KEY_ID=rzp_live_SuNUVQNE9dPd8t
+RAZORPAY_KEY_SECRET=xOMZuSoiaFsEtEdJcSVWRDR2
+
+# Shiprocket (for Order Tracking)
+SHIPROCKET_EMAIL=n34@gmail.com
+SHIPROCKET_PASSWORD=n34@12345
+
+# ImageKit (optional, used for uploads/media if enabled in backend)
+IMAGEKIT_PUBLIC_KEY=public_xxxxxxxxxxxxxxxxx
+IMAGEKIT_PRIVATE_KEY=private_xxxxxxxxxxxxxxxxx
+IMAGEKIT_URL_ENDPOINT=ik.imagekit.io/your_imagekit_id
+
+# WhatsApp OTP Login Config
+WHATSAPP_ACCESS_TOKEN=EAAUD1Y3umaoBR8m47dT4ggf9CApXb5ivGrSO3oyp52Lz0ZA9UcBgEj8EHEaQJrMUw0KRrWzFmo6yl1CC4ZBZB9EHzArpgIlCb6KyZASdQJTvSLTJ4ZAsi0DgQSEImghY1CP63ZAo342ZBsKP9OjzOt4Fomo7dCDJ4Y1KISfoMEFxSBKtWXBQhVC4dyXLvMyXVH9ZCQZDZD
+WHATSAPP_PHONE_NUMBER_ID=1230871206776708
+WHATSAPP_OTP_TEMPLATE=otp_login
+WHATSAPP_OTP_LANGUAGE=en
