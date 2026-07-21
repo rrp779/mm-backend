@@ -1,4 +1,6 @@
-require("dotenv").config();
+// Always load env from this folder (works even if started from repo root).
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 
  
 
@@ -6,9 +8,9 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer");
-const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
+const dns = require("dns");
 
 const app = express();
 
@@ -20,9 +22,17 @@ const NodeCache = require("node-cache");
 const cache = new NodeCache({ stdTTL: 60 });  
 const Review = require("./models/Review");
 
+const RAZORPAY_KEY_ID = String(process.env.RAZORPAY_KEY_ID || "").trim();
+const RAZORPAY_KEY_SECRET = String(process.env.RAZORPAY_KEY_SECRET || "").trim();
+if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+  throw new Error(
+    "Missing Razorpay credentials. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in mm-backend/.env (copy from .env.example)."
+  );
+}
+
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
+  key_id: RAZORPAY_KEY_ID,
+  key_secret: RAZORPAY_KEY_SECRET,
 });
 
 const SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket_jwt";
@@ -31,6 +41,12 @@ const ORDER_STATUS_CACHE_PREFIX = "order_status:";
 const ORDER_STATUS_CACHE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
 const TRACKING_STATE_CACHE_PREFIX = "tracking_state:";
 const TRACKING_STATE_TTL_SEC = 14 * 24 * 60 * 60; // 14 days
+const WHATSAPP_OTP_CACHE_PREFIX = "whatsapp_otp:";
+const WHATSAPP_OTP_TTL_SEC = Number(process.env.WHATSAPP_OTP_TTL_SEC || 300);
+const WHATSAPP_OTP_MAX_ATTEMPTS = Number(process.env.WHATSAPP_OTP_MAX_ATTEMPTS || 5);
+const OTP_CUSTOMER_EMAIL_DOMAIN = String(
+  process.env.OTP_CUSTOMER_EMAIL_DOMAIN || "phone.makeupmystery.local"
+).trim();
 
 const ADMIN_MONITOR_TOKEN = String(process.env.ADMIN_MONITOR_TOKEN || "").trim();
 const MONITORING_ENABLED =
@@ -44,6 +60,43 @@ const SHIPROCKET_FAIL_THRESHOLD = Number(process.env.SHIPROCKET_FAIL_THRESHOLD |
 function isTruthyEnv(value) {
   const s = String(value ?? "").trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on";
+}
+
+function normalizeIndianPhone(raw) {
+  let phone = String(raw || "").replace(/[^\d+]/g, "").trim();
+  if (!phone) return "";
+  if (phone.startsWith("+")) {
+    phone = `+${phone.slice(1).replace(/\D/g, "")}`;
+  } else {
+    phone = phone.replace(/\D/g, "");
+    if (phone.length === 10) phone = `+91${phone}`;
+    else if (phone.startsWith("91") && phone.length === 12) phone = `+${phone}`;
+    else phone = `+${phone}`;
+  }
+  return phone;
+}
+
+function otpCacheKey(phone) {
+  return `${WHATSAPP_OTP_CACHE_PREFIX}${phone}`;
+}
+
+function hashOtp(phone, otp) {
+  const secret = process.env.OTP_SECRET || process.env.RAZORPAY_KEY_SECRET || "dev-otp-secret";
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`${phone}:${otp}`)
+    .digest("hex");
+}
+
+function makeOtpCustomerEmail(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return `${digits}@${OTP_CUSTOMER_EMAIL_DOMAIN}`;
+}
+
+function makeOtpCustomerPassword(phone) {
+  const secret = process.env.OTP_SECRET || process.env.RAZORPAY_KEY_SECRET || "dev-otp-secret";
+  const token = crypto.createHmac("sha256", secret).update(String(phone)).digest("hex").slice(0, 28);
+  return `Mm#${token}9a`;
 }
 
 // Enable verbose order/tracking logs only when explicitly requested via env.
@@ -141,6 +194,33 @@ function errorInfo(err) {
   const code = err?.code;
   const message = err?.message ? String(err.message) : String(err || "");
   return { message, status: status ?? null, code: code ?? null };
+}
+
+function normalizePhoneE164(phone, defaultCountry = "IN") {
+  const raw = String(phone ?? "").trim();
+  if (!raw) return null;
+
+  // Keep only digits and leading +
+  let cleaned = raw.replace(/[^\d+]/g, "");
+
+  // Convert 00 prefix to +
+  if (cleaned.startsWith("00")) cleaned = `+${cleaned.slice(2)}`;
+
+  if (cleaned.startsWith("+")) {
+    const digits = cleaned.slice(1).replace(/\D/g, "");
+    if (digits.length < 10 || digits.length > 15) return null;
+    return `+${digits}`;
+  }
+
+  const digits = cleaned.replace(/\D/g, "");
+  if (defaultCountry === "IN") {
+    if (digits.length === 10) return `+91${digits}`;
+    if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
+  }
+
+  // Fallback: accept 10-15 digits without country code by prefixing +
+  if (digits.length >= 10 && digits.length <= 15) return `+${digits}`;
+  return null;
 }
 
 function parseBoolQuery(value) {
@@ -337,6 +417,238 @@ async function getShopifyCustomerIdByEmail(email) {
   );
   const customerId = response?.data?.customers?.[0]?.id;
   return customerId || null;
+}
+
+function getStorefrontToken() {
+  return (
+    process.env.SHOPIFY_STOREFRONT_TOKEN ||
+    process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN ||
+    process.env.SHOPIFY_STORE_FRONT_TOKEN ||
+    process.env.SHOPIFY_API_KEY ||
+    ""
+  );
+}
+
+async function shopifyStorefrontRequest(query, variables) {
+  const token = getStorefrontToken();
+  if (!process.env.SHOPIFY_STORE || !token) {
+    throw new Error("Shopify storefront env vars are not configured");
+  }
+
+  const response = await axios.post(
+    `https://${process.env.SHOPIFY_STORE}/api/2024-04/graphql.json`,
+    { query, variables },
+    {
+      headers: {
+        "X-Shopify-Storefront-Access-Token": token,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
+    }
+  );
+
+  if (Array.isArray(response?.data?.errors) && response.data.errors.length) {
+    throw new Error(response.data.errors[0]?.message || "Shopify storefront error");
+  }
+
+  return response.data?.data || {};
+}
+
+async function createOtpCustomer({ phone, firstName, lastName }) {
+  const email = makeOtpCustomerEmail(phone);
+  const password = makeOtpCustomerPassword(phone);
+
+  const data = await shopifyStorefrontRequest(
+    `
+      mutation CreateOtpCustomer($input: CustomerCreateInput!) {
+        customerCreate(input: $input) {
+          customer { id }
+          customerUserErrors { message }
+        }
+      }
+    `,
+    {
+      input: {
+        email,
+        password,
+        phone,
+        firstName: firstName || "Customer",
+        lastName: lastName || "Customer",
+      },
+    }
+  );
+
+  const errors = data?.customerCreate?.customerUserErrors || [];
+  if (errors.length) {
+    const errMsg = String(errors[0]?.message || "");
+    if (errMsg.toLowerCase().includes("phone") && errMsg.toLowerCase().includes("taken")) {
+      throw new Error("This phone number is already registered to an email account. Please log in using your email and password.");
+    }
+    if (!errMsg.toLowerCase().includes("already")) {
+      throw new Error(errMsg || "Unable to create customer");
+    }
+  }
+
+  return { email, password };
+}
+
+async function loginOtpCustomer(phone) {
+  const email = makeOtpCustomerEmail(phone);
+  const password = makeOtpCustomerPassword(phone);
+
+  const data = await shopifyStorefrontRequest(
+    `
+      mutation LoginOtpCustomer($input: CustomerAccessTokenCreateInput!) {
+        customerAccessTokenCreate(input: $input) {
+          customerAccessToken {
+            accessToken
+            expiresAt
+          }
+          customerUserErrors { message }
+        }
+      }
+    `,
+    {
+      input: { email, password },
+    }
+  );
+
+  const errors = data?.customerAccessTokenCreate?.customerUserErrors || [];
+  const token = data?.customerAccessTokenCreate?.customerAccessToken;
+  if (errors.length || !token) {
+    throw new Error(errors[0]?.message || "Unable to login customer");
+  }
+
+  return token;
+}
+
+async function getShopifyCustomerByPhone(phone) {
+  if (!phone) return null;
+  
+  try {
+    const query = encodeURIComponent(`phone:${phone.trim()}`);
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    if (response?.data?.customers?.[0]) {
+      return response.data.customers[0];
+    }
+  } catch (err) {
+    console.error("Search customer by E164 phone failed:", err.message);
+  }
+
+  try {
+    const digitsOnly = phone.replace(/\D/g, "");
+    const query = encodeURIComponent(`phone:${digitsOnly}`);
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    if (response?.data?.customers?.[0]) {
+      return response.data.customers[0];
+    }
+  } catch (err) {
+    console.error("Search customer by digits phone failed:", err.message);
+  }
+
+  try {
+    const digitsOnly = phone.replace(/\D/g, "");
+    if (digitsOnly.length > 10) {
+      const tenDigits = digitsOnly.substring(digitsOnly.length - 10);
+      const query = encodeURIComponent(`phone:${tenDigits}`);
+      const response = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+      if (response?.data?.customers?.[0]) {
+        return response.data.customers[0];
+      }
+    }
+  } catch (err) {
+    console.error("Search customer by 10-digit phone failed:", err.message);
+  }
+
+  return null;
+}
+
+async function updateShopifyCustomerPassword(customerId, newPassword) {
+  await axios.put(
+    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/${customerId}.json`,
+    {
+      customer: {
+        id: customerId,
+        password: newPassword,
+        password_confirmation: newPassword,
+      },
+    },
+    {
+      headers: {
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+    }
+  );
+}
+
+async function loginOtpCustomerWithRealEmail(email, phone) {
+  const password = makeOtpCustomerPassword(phone);
+
+  const data = await shopifyStorefrontRequest(
+    `
+      mutation LoginOtpCustomer($input: CustomerAccessTokenCreateInput!) {
+        customerAccessTokenCreate(input: $input) {
+          customerAccessToken {
+            accessToken
+            expiresAt
+          }
+          customerUserErrors { message }
+        }
+      }
+    `,
+    {
+      input: { email, password },
+    }
+  );
+
+  const errors = data?.customerAccessTokenCreate?.customerUserErrors || [];
+  const token = data?.customerAccessTokenCreate?.customerAccessToken;
+  if (errors.length || !token) {
+    throw new Error(errors[0]?.message || "Unable to login customer");
+  }
+
+  return token;
+}
+
+async function getOrCreateOtpCustomerToken({ phone, firstName, lastName }) {
+  try {
+    return await loginOtpCustomer(phone);
+  } catch (_) {
+    // Check if the phone is registered to an existing customer account!
+    const existingCustomer = await getShopifyCustomerByPhone(phone);
+    if (existingCustomer) {
+      if (!existingCustomer.email) {
+        throw new Error("Shopify has redacted the email for this customer. Please go to your Shopify Admin -> Develop Apps -> Select your app -> API Integration, and request/enable access to 'Protected Customer Data' so the app can link WhatsApp logins to email accounts.");
+      }
+      const password = makeOtpCustomerPassword(phone);
+      await updateShopifyCustomerPassword(existingCustomer.id, password);
+      return await loginOtpCustomerWithRealEmail(existingCustomer.email, phone);
+    }
+
+    await createOtpCustomer({ phone, firstName, lastName });
+    return await loginOtpCustomer(phone);
+  }
 }
 
 async function getShiprocketToken() {
@@ -611,6 +923,7 @@ async function fetchShiprocketTrackingByAwb(awb, opts) {
 
 
 app.use(cors());
+app.use("/assets", express.static(path.join(__dirname, "assets")));
 app.use(express.json());
 
 app.use((req, res, next) => {
@@ -1640,7 +1953,7 @@ app.get("/api/sections", async (req, res) => {
 
   } catch (err) {
     console.error("Sections fetch error:", err);
-    res.status(500).json([]);
+    res.status(500).json({ error: "Failed to load sections", details: err.message });
   }
 });
 
@@ -1748,7 +2061,7 @@ app.get("/api/products/:id", async (req, res) => {
 
   } catch (err) {
     console.error("Product error:", err.message);
-    res.status(500).json({});
+    res.status(500).json({ error: "Product fetch failed", details: err.message });
   }
 });
 
@@ -2070,19 +2383,33 @@ app.get("/api/shopify/search", async (req, res) => {
 
 /* ------------------ SHOPIFY COUPONS ------------------ */
 
+function getNextShopifyLink(linkHeader) {
+  const header = String(linkHeader || "").trim();
+  if (!header) return null;
+  const parts = header.split(",");
+  for (const part of parts) {
+    const seg = part.trim();
+    if (!seg.includes('rel="next"')) continue;
+    const m = seg.match(/<([^>]+)>/);
+    return m?.[1] || null;
+  }
+  return null;
+}
+
 app.get("/api/shopify/coupons", async (req, res) => {
   try {
 
-    const priceRulesResponse = await axios.get(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules.json`,
-      {
+    const rules = [];
+    let nextUrl = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules.json?limit=250`;
+    for (let page = 0; page < 20 && nextUrl; page++) {
+      const resp = await axios.get(nextUrl, {
         headers: {
           "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
         },
-      }
-    );
-
-    const rules = priceRulesResponse.data.price_rules || [];
+      });
+      rules.push(...(resp.data.price_rules || []));
+      nextUrl = getNextShopifyLink(resp.headers?.link);
+    }
 
     let coupons = [];
     const now = new Date();
@@ -2102,7 +2429,7 @@ app.get("/api/shopify/coupons", async (req, res) => {
       if (!Number.isFinite(valueNumber) || valueNumber <= 0) continue;
 
       const codesResponse = await axios.get(
-        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules/${rule.id}/discount_codes.json`,
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/price_rules/${rule.id}/discount_codes.json?limit=250`,
         {
           headers: {
             "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
@@ -2921,11 +3248,182 @@ app.get("/api/shopify/collections", async (req, res) => {
 });
 
 
+/* ------------------ WHATSAPP OTP AUTH ------------------ */
+
+async function sendWhatsAppOtpMessage(phone, otp) {
+  const token = process.env.WHATSAPP_ACCESS_TOKEN;
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const template = process.env.WHATSAPP_OTP_TEMPLATE || "otp_login";
+  const language = process.env.WHATSAPP_OTP_LANGUAGE || "en";
+  const apiVersion = process.env.WHATSAPP_API_VERSION || "v20.0";
+
+  if (!token || !phoneNumberId) {
+    const allowDevOtp =
+      isTruthyEnv(process.env.ALLOW_DEV_OTP) ||
+      String(process.env.NODE_ENV || "").trim().toLowerCase() !== "production";
+    if (allowDevOtp) return { devOtp: otp };
+    throw new Error("WhatsApp credentials are not configured");
+  }
+
+  await axios.post(
+    `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to: phone.replace(/^\+/, ""),
+      type: "template",
+      template: {
+        name: template,
+        language: { code: language },
+        components: [
+          {
+            type: "body",
+            parameters: [{ type: "text", text: otp }],
+          },
+          {
+            type: "button",
+            sub_type: "url",
+            index: "0",
+            parameters: [{ type: "text", text: otp }],
+          },
+        ],
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
+    }
+  );
+
+  return {};
+}
+
+app.post("/api/auth/whatsapp/send-otp", async (req, res) => {
+  try {
+    const phone = normalizeIndianPhone(req.body?.phone);
+    if (!/^\+\d{10,15}$/.test(phone)) {
+      return res.status(400).json({ success: false, message: "Enter a valid phone number" });
+    }
+
+    const otp = String(crypto.randomInt(100000, 1000000));
+    cache.set(
+      otpCacheKey(phone),
+      {
+        hash: hashOtp(phone, otp),
+        attempts: 0,
+        createdAt: Date.now(),
+      },
+      WHATSAPP_OTP_TTL_SEC
+    );
+
+    const sendResult = await sendWhatsAppOtpMessage(phone, otp);
+
+    return res.json({
+      success: true,
+      message: "OTP sent on WhatsApp",
+      ...(sendResult.devOtp ? { devOtp: sendResult.devOtp } : {}),
+    });
+  } catch (err) {
+    console.error("WhatsApp OTP send error:", errorInfo(err));
+    if (err?.response?.data) console.error("WhatsApp error details:", err.response.data);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to send WhatsApp OTP",
+      details: err?.response?.data || null,
+    });
+  }
+});
+
+app.post("/api/auth/whatsapp/verify-otp", async (req, res) => {
+  try {
+    const phone = normalizeIndianPhone(req.body?.phone);
+    const otp = String(req.body?.otp || "").trim();
+    const firstName = String(req.body?.firstName || "").trim();
+    const lastName = String(req.body?.lastName || "").trim();
+    const verifyOnly = Boolean(req.body?.verifyOnly);
+
+    if (!/^\+\d{10,15}$/.test(phone) || !/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ success: false, message: "Invalid phone or OTP" });
+    }
+
+    const entry = cache.get(otpCacheKey(phone));
+    if (!entry) {
+      return res.status(400).json({ success: false, message: "OTP expired. Please request a new OTP." });
+    }
+
+    if (Number(entry.attempts || 0) >= WHATSAPP_OTP_MAX_ATTEMPTS) {
+      cache.del(otpCacheKey(phone));
+      return res.status(429).json({ success: false, message: "Too many attempts. Please request a new OTP." });
+    }
+
+    const expected = String(entry.hash || "");
+    const actual = hashOtp(phone, otp);
+    const ok =
+      expected.length === actual.length &&
+      crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+
+    if (!ok) {
+      cache.set(
+        otpCacheKey(phone),
+        { ...entry, attempts: Number(entry.attempts || 0) + 1 },
+        WHATSAPP_OTP_TTL_SEC
+      );
+      return res.status(400).json({ success: false, message: "Incorrect OTP" });
+    }
+
+    if (verifyOnly) {
+      cache.del(otpCacheKey(phone));
+      return res.json({
+        success: true,
+        phone,
+        verified: true,
+      });
+    }
+
+    const token = await getOrCreateOtpCustomerToken({ phone, firstName, lastName });
+
+    cache.del(otpCacheKey(phone));
+
+    return res.json({
+      success: true,
+      customer: {
+        accessToken: token.accessToken,
+        expiresAt: token.expiresAt,
+        phone,
+        authProvider: "whatsapp",
+      },
+    });
+  } catch (err) {
+    console.error("WhatsApp OTP verify error:", errorInfo(err));
+    if (err?.response?.data) console.error("Shopify OTP customer error details:", err.response.data);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Unable to verify WhatsApp OTP",
+      details: err?.response?.data || null,
+    });
+  }
+});
+
+
 /* ------------------ CREATE PAYMENT ORDER ------------------ */
+
+// Public config needed by mobile app (safe to expose key_id).
+app.get("/api/payment/config", (req, res) => {
+  res.json({
+    key_id: String(process.env.RAZORPAY_KEY_ID || "").trim(),
+  });
+});
 
 app.post("/api/payment/create-order", async (req, res) => {
   try {
     const { amount, cart, email, phone } = req.body;
+    const keyId = String(process.env.RAZORPAY_KEY_ID || "").trim();
+
+    if (!keyId || !process.env.RAZORPAY_KEY_SECRET) {
+      return res.status(500).json({ error: "Payment config missing" });
+    }
 
     const receiptId = "order_" + Date.now();
 
@@ -2944,7 +3442,10 @@ app.post("/api/payment/create-order", async (req, res) => {
 
     const order = await razorpay.orders.create(options);
 
-    res.json(order);
+    res.json({
+      ...order,
+      key_id: keyId,
+    });
 
   } catch (error) {
     console.error("Razorpay order error:", error);
@@ -3016,10 +3517,14 @@ app.post("/api/payment/verify", async (req, res) => {
     const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
 
     const couponDisc = Math.max(0, Number(couponDiscount || 0));
-    const orderTotal = Math.max(
+    const calculatedOrderTotal = Math.max(
       0,
       cartSubtotal + Number(finalShipping.price) - couponDisc - bundleDisc
     );
+    const paidAmount = Number(razorpayOrder.amount_paid || razorpayOrder.amount || amount || 0) / 100;
+    const orderTotal = Number.isFinite(paidAmount) && paidAmount > 0
+      ? paidAmount
+      : calculatedOrderTotal;
 
     const discountCodesPayload = [];
 
@@ -3063,6 +3568,7 @@ app.post("/api/payment/verify", async (req, res) => {
     /* ------------------ CREATE SHOPIFY ORDER ------------------ */
 
     const shopifyCustomerId = await getShopifyCustomerIdByEmail(email);
+    const normalizedPhone = normalizePhoneE164(phone, "IN");
 
     const shopifyOrder = await axios.post(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
@@ -3079,7 +3585,7 @@ app.post("/api/payment/verify", async (req, res) => {
     first_name,
     last_name,
     email,
-    phone,
+    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
   },
 
   email,
@@ -3093,7 +3599,7 @@ app.post("/api/payment/verify", async (req, res) => {
     province: province || state,
     country: country || "India",
     zip: pincode,
-    phone,
+    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
   },
 
   shipping_address: {
@@ -3105,7 +3611,7 @@ app.post("/api/payment/verify", async (req, res) => {
     province: province || state,
     country: country || "India",
     zip: pincode,
-    phone,
+    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
   },
 
   shipping_lines: [
@@ -3138,7 +3644,7 @@ app.post("/api/payment/verify", async (req, res) => {
   note_attributes: [
     { name: "Payment ID", value: razorpay_payment_id },
     { name: "Order ID", value: razorpay_order_id },
-    { name: "Customer Phone", value: phone },
+    { name: "Customer Phone", value: normalizedPhone || String(phone || "") },
     { name: "Receipt", value: razorpayOrder.receipt },
     ...(couponCode ? [
       { name: "Coupon Code", value: String(couponCode) },
@@ -3185,19 +3691,87 @@ app.post("/api/payment/verify", async (req, res) => {
     });
 
   } catch (err) {
-  console.error("FULL ERROR:", errorInfo(err));
-  res.json({ success: false, message: err.message });
-} 
+    const info = errorInfo(err);
+    const shopifyStatus = err?.response?.status ?? null;
+    const shopifyData = err?.response?.data ?? null;
+
+    console.error("FULL ERROR:", info);
+    if (shopifyStatus || shopifyData) {
+      console.error("SHOPIFY ERROR DETAILS:", {
+        status: shopifyStatus,
+        data: shopifyData,
+      });
+    }
+
+    const details =
+      shopifyData?.errors ||
+      shopifyData?.error ||
+      shopifyData ||
+      null;
+
+    res.json({
+      success: false,
+      message: info.message || "Order creation failed",
+      details,
+    });
+  } 
 });
 
  
 
 /* ------------------ START SERVER ------------------ */
 
+function getMongoHostname(mongoUri) {
+  try {
+    return new URL(String(mongoUri)).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+async function preflightMongoSrvLookup(mongoUri) {
+  const uri = String(mongoUri || "").trim();
+  if (!uri || !uri.startsWith("mongodb+srv://")) return;
+
+  const host = getMongoHostname(uri);
+  if (!host) return;
+
+  const srvRecord = `_mongodb._tcp.${host}`;
+
+  const override = String(process.env.MONGO_DNS_SERVERS || "").trim();
+  if (override) {
+    const servers = override
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (servers.length) dns.setServers(servers);
+  }
+
+  try {
+    await dns.promises.resolveSrv(srvRecord);
+  } catch (err) {
+    const code = err?.code;
+    if (code === "ECONNREFUSED" || code === "ETIMEOUT") {
+      const hint =
+        "MongoDB SRV DNS lookup failed from Node. This usually means your DNS server/network is refusing SRV queries.\n" +
+        `SRV record: ${srvRecord}\n` +
+        "Fix options:\n" +
+        "- Set MONGO_DNS_SERVERS=1.1.1.1,8.8.8.8 (or your trusted DNS servers)\n" +
+        "- Or change MONGO_URI to a non-SRV mongodb:// connection string (comma-separated hosts)\n";
+      const e = new Error(hint);
+      e.code = "MONGO_SRV_DNS";
+      e.cause = err;
+      throw e;
+    }
+    throw err;
+  }
+}
+
 async function startServer() {
   try {
     
     
+    await preflightMongoSrvLookup(process.env.MONGO_URI);
     await mongoose.connect(process.env.MONGO_URI);
 
     console.log("MongoDB Atlas connected ✅");
@@ -3220,13 +3794,27 @@ async function startServer() {
       console.warn("⚠️  Logo not found. Place logo.png in assets/ folder.");
     }
 
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`Server running on port ${PORT} 🚀`);
+    });
+
+    server.on("error", (err) => {
+      if (err && err.code === "EADDRINUSE") {
+        console.error(
+          `Port ${PORT} is already in use (EADDRINUSE). Stop the other process or change PORT in mm-backend/.env.`
+        );
+        process.exit(1);
+      }
+      console.error("Server failed to start:", errorInfo(err));
+      process.exit(1);
     });
 
   } catch (error) {
     console.error("MongoDB connection failed ❌");
     console.error(errorInfo(error));
+    console.error(
+      "MongoDB fix checklist: allow your current IP in MongoDB Atlas Network Access, confirm your network/VPN allows outbound TCP 27017, and remove/fix NODE_EXTRA_CA_CERTS if it points to a missing cert file."
+    );
     process.exit(1);
   }
 }
