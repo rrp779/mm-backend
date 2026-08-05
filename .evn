@@ -2,8 +2,8 @@
 PORT=5500
 MONGO_URI=mongodb+srv://ritesh_db_user:AswsLk1lm6LGJ3L4@mm-mobile-app.3knifbd.mongodb.net/?appName=mm-mobile-app
 SHOPIFY_STORE=makeup-mystery-india.myshopify.com
-SHOPIFY_ADMIN_TOKEN=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 
-SHOPIFY_STOREFRONT_TOKEN=6d1ee35c574a5b42ea8abafcb1e8f3e5
+SHOPIFY_ADMIN_TOKEN=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 
+SHOPIFY_STOREFRONT_TOKEN=197bc29fa02d6ed79c4ee480f8c3493b
 MONGO_DNS_SERVERS=1.1.1.1,8.8.8.8
 # Reviews
 REQUIRE_PURCHASED_REVIEW=true
