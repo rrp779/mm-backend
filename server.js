@@ -2061,6 +2061,9 @@ app.get("/api/products/:id", async (req, res) => {
 
   } catch (err) {
     console.error("Product error:", err.message);
+   console.error("Status:", err.response?.status);
+console.error("Data:", err.response?.data);
+console.error("Message:", err.message);
     res.status(500).json({ error: "Product fetch failed", details: err.message });
   }
 });
