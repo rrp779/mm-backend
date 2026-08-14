@@ -999,6 +999,44 @@ function calculateShipping(cartSubtotal, isCod = false) {
     : { title: "Standard Shipping", price: "80.00",  code: "FLAT" };
 }
 
+function getShippingForCart(cart, cartSubtotal) {
+  if (!Array.isArray(cart) || cart.length === 0) {
+    return calculateShipping(cartSubtotal, false);
+  }
+  
+  let shipping = 0;
+  let hasRegularProduct = false;
+  
+  for (const item of cart) {
+    const handle = String(item.handle || "").trim().toLowerCase();
+    const qty = Number(item.quantity || item.qty || 1);
+    
+    if (handle === "portable-makeup-artist-chair-with-headrest") {
+      shipping += 300 * qty;
+    } else if (
+      handle === "premium-edition-vanity-bag-with-6-pouches" ||
+      handle === "makeup-mystery-vanity-bag-with-6-pouches" ||
+      handle === "beyond-vanity-bag" ||
+      handle === "makeup-mystery-hair-makeup-vanity-bag-with-4-pouches" ||
+      handle === "beyond-box-makeup-vanity"
+    ) {
+      shipping += 480 * qty;
+    } else {
+      hasRegularProduct = true;
+    }
+  }
+  
+  if (hasRegularProduct) {
+    shipping += 80;
+  }
+  
+  return {
+    title: shipping === 0 ? "Free Shipping" : "Standard Shipping",
+    price: shipping.toFixed(2),
+    code: shipping === 0 ? "FREE" : "FLAT",
+  };
+}
+
 function toProductGid(productIdOrGid) {
   const raw = decodeURIComponent(String(productIdOrGid || "")).trim();
   if (!raw) return null;
@@ -3502,16 +3540,7 @@ app.post("/api/payment/verify", async (req, res) => {
     const cartSubtotal = cart.reduce((sum, item) => {
       return sum + (Number(item.price || 0) * Number(item.quantity || 1));
     }, 0);
-    const passedShipping = Number(shippingAmount);
-    const hasPassedShipping = Number.isFinite(passedShipping) && passedShipping >= 0;
-
-    const finalShipping = hasPassedShipping
-      ? {
-          title: passedShipping === 0 ? "Free Shipping" : "Standard Shipping",
-          price: passedShipping.toFixed(2),
-          code: passedShipping === 0 ? "FREE" : "FLAT",
-        }
-      : calculateShipping(cartSubtotal, false);
+    const finalShipping = getShippingForCart(cart, cartSubtotal);
 
     const bundleInfo = await computeAny3BundleDiscount(cart);
     const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
