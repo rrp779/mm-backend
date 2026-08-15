@@ -4,7 +4,7 @@ const axios = require("axios");
 
 // 🔐 Replace with your real values
 const SHOP_DOMAIN = "makeup-mystery-india.myshopify.com";
-const STOREFRONT_TOKEN = "6d1ee35c574a5b42ea8abafcb1e8f3e5";
+const STOREFRONT_TOKEN = "96a8a304c6865dbb9cd20edac41e275d";
 
 router.get("/collections", async (req, res) => {
   try {
