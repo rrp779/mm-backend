@@ -404,19 +404,44 @@ async function computeAny3BundleDiscount(cart) {
   return { discount, bundles, eligibleQty };
 }
 
-async function getShopifyCustomerIdByEmail(email) {
-  if (!email) return null;
-  const query = encodeURIComponent(`email:${String(email).trim()}`);
-  const response = await axios.get(
-    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
-    {
-      headers: {
-        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-      },
+async function getShopifyCustomerId(email, phone) {
+  try {
+    if (email && String(email).trim()) {
+      const query = encodeURIComponent(`email:${String(email).trim()}`);
+      const response = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+      const customerId = response?.data?.customers?.[0]?.id;
+      if (customerId) return customerId;
     }
-  );
-  const customerId = response?.data?.customers?.[0]?.id;
-  return customerId || null;
+
+    const normalizedPhone = normalizePhoneE164(phone, "IN");
+    if (normalizedPhone) {
+      const query = encodeURIComponent(`phone:${normalizedPhone}`);
+      const response = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+      const customerId = response?.data?.customers?.[0]?.id;
+      if (customerId) return customerId;
+    }
+  } catch (err) {
+    console.error("[Shopify Customer Lookup Error]:", err.message);
+  }
+  return null;
+}
+
+async function getShopifyCustomerIdByEmail(email) {
+  return getShopifyCustomerId(email, null);
 }
 
 function getStorefrontToken() {
@@ -924,7 +949,11 @@ async function fetchShiprocketTrackingByAwb(awb, opts) {
 
 app.use(cors());
 app.use("/assets", express.static(path.join(__dirname, "assets")));
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
 
 app.use((req, res, next) => {
   res.locals.reqId = res.locals.reqId || newReqId();
@@ -2237,6 +2266,41 @@ const TrendingSchema = new mongoose.Schema({
 });
 
 const Trending = mongoose.model("Trending", TrendingSchema);
+ 
+/* ------------------ ORDER SCHEMA & PERSISTENCE ------------------ */
+
+const OrderSchema = new mongoose.Schema({
+  razorpay_order_id: { type: String, required: true, unique: true, index: true },
+  razorpay_payment_id: { type: String, index: true },
+  razorpay_signature: String,
+  status: {
+    type: String,
+    enum: ["created", "paid", "shopify_created", "failed"],
+    default: "created",
+    index: true,
+  },
+  amount: Number,
+  cart: { type: Array, default: [] },
+  email: String,
+  phone: String,
+  first_name: String,
+  last_name: String,
+  billing_address: Object,
+  shipping_address: Object,
+  couponCode: String,
+  couponDiscount: Number,
+  shippingAmount: Number,
+  totalMrp: Number,
+  productDiscount: Number,
+  shopify_order_id: String,
+  shopify_order_number: String,
+  shopify_order_data: Object,
+  error_log: String,
+  created_at: { type: Date, default: Date.now },
+  updated_at: { type: Date, default: Date.now },
+});
+
+const Order = mongoose.model("Order", OrderSchema);
 
 
 /* ------------------ TRACK PRODUCT VIEW ------------------ */
@@ -3456,7 +3520,23 @@ app.get("/api/payment/config", (req, res) => {
 
 app.post("/api/payment/create-order", async (req, res) => {
   try {
-    const { amount, cart, email, phone } = req.body;
+    const {
+      amount,
+      cart,
+      email,
+      phone,
+      first_name,
+      last_name,
+      address,
+      billing_address,
+      shipping_address,
+      couponCode,
+      couponDiscount,
+      shippingAmount,
+      totalMrp,
+      productDiscount,
+    } = req.body;
+
     const keyId = String(process.env.RAZORPAY_KEY_ID || "").trim();
 
     if (!keyId || !process.env.RAZORPAY_KEY_SECRET) {
@@ -3464,21 +3544,50 @@ app.post("/api/payment/create-order", async (req, res) => {
     }
 
     const receiptId = "order_" + Date.now();
+    const cleanEmail = String(email || "").trim();
+    const cleanPhone = String(phone || "").trim();
 
+    // Lightweight notes to stay strictly under Razorpay 1024-character note limits
     const options = {
       amount,
       currency: "INR",
       receipt: receiptId,
-
       notes: {
-        email,
-        phone,
-        cart: JSON.stringify(cart),
+        email: cleanEmail.slice(0, 100),
+        phone: cleanPhone.slice(0, 30),
         receipt: receiptId,
+        itemsCount: Array.isArray(cart) ? String(cart.length) : "0",
       },
     };
 
     const order = await razorpay.orders.create(options);
+
+    // Persist full order & cart metadata in MongoDB
+    try {
+      const selectedShipAddr = shipping_address || address || {};
+      const selectedBillAddr = billing_address || address || {};
+
+      await Order.create({
+        razorpay_order_id: order.id,
+        status: "created",
+        amount: Number(amount || 0) / 100,
+        cart: Array.isArray(cart) ? cart : [],
+        email: cleanEmail,
+        phone: cleanPhone,
+        first_name: String(first_name || "").trim(),
+        last_name: String(last_name || "").trim(),
+        shipping_address: selectedShipAddr,
+        billing_address: selectedBillAddr,
+        couponCode: couponCode || null,
+        couponDiscount: Number(couponDiscount || 0),
+        shippingAmount: Number(shippingAmount || 0),
+        totalMrp: totalMrp !== undefined ? Number(totalMrp) : null,
+        productDiscount: productDiscount !== undefined ? Number(productDiscount) : null,
+      });
+      console.log(`[Order Persistence] Saved initial order record in MongoDB for Razorpay Order ${order.id}`);
+    } catch (dbErr) {
+      console.error("[Order Persistence Error]:", dbErr.message);
+    }
 
     res.json({
       ...order,
@@ -3490,7 +3599,298 @@ app.post("/api/payment/create-order", async (req, res) => {
     res.status(500).json({ error: "Payment order failed" });
   }
 });
- 
+
+/* ------------------ PROCESS & CREATE SHOPIFY ORDER ENGINE ------------------ */
+
+async function processAndCreateShopifyOrder({
+  razorpay_order_id,
+  razorpay_payment_id,
+  razorpay_signature,
+  customerData = {},
+}) {
+  if (!razorpay_order_id) {
+    throw new Error("Missing razorpay_order_id");
+  }
+
+  // 1. Fetch order from MongoDB
+  let dbOrder = await Order.findOne({ razorpay_order_id });
+
+  // If already created in Shopify, return existing order (Idempotent)
+  if (dbOrder && dbOrder.status === "shopify_created" && dbOrder.shopify_order_id) {
+    console.log(`[Order Engine] Order ${razorpay_order_id} already created in Shopify (ID: ${dbOrder.shopify_order_id})`);
+    return {
+      success: true,
+      order: dbOrder.shopify_order_data || { id: dbOrder.shopify_order_id, name: dbOrder.shopify_order_number },
+      message: "Order already created",
+    };
+  }
+
+  // 2. Fetch Razorpay Order for verification & fallback
+  let razorpayOrder = null;
+  try {
+    razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
+  } catch (rErr) {
+    console.error("[Order Engine] Failed to fetch Razorpay order:", rErr.message);
+  }
+
+  // Retrieve cart: prefer MongoDB saved cart, fallback to notes.cart
+  let cart = (dbOrder && Array.isArray(dbOrder.cart) && dbOrder.cart.length > 0)
+    ? dbOrder.cart
+    : [];
+
+  if (cart.length === 0 && razorpayOrder?.notes?.cart) {
+    try {
+      cart = JSON.parse(razorpayOrder.notes.cart || "[]");
+    } catch (parseErr) {
+      console.error("[Order Engine] Error parsing cart from notes:", parseErr.message);
+    }
+  }
+
+  // Merge customer and address info
+  const first_name = customerData.first_name || dbOrder?.first_name || "";
+  const last_name = customerData.last_name || dbOrder?.last_name || "";
+  const email = customerData.email || dbOrder?.email || razorpayOrder?.notes?.email || "";
+  const phone = customerData.phone || dbOrder?.phone || razorpayOrder?.notes?.phone || "";
+  const address1 = customerData.address1 || dbOrder?.shipping_address?.address1 || "";
+  const address2 = customerData.address2 || dbOrder?.shipping_address?.address2 || "";
+  const city = customerData.city || dbOrder?.shipping_address?.city || "";
+  const province = customerData.province || customerData.state || dbOrder?.shipping_address?.province || "";
+  const country = customerData.country || dbOrder?.shipping_address?.country || "India";
+  const pincode = customerData.pincode || customerData.zip || dbOrder?.shipping_address?.zip || "";
+
+  const couponCode = customerData.couponCode || dbOrder?.couponCode || null;
+  const couponDiscount = Number(customerData.couponDiscount || dbOrder?.couponDiscount || 0);
+  const totalMrp = customerData.totalMrp ?? dbOrder?.totalMrp;
+  const productDiscount = customerData.productDiscount ?? dbOrder?.productDiscount;
+
+  // 3. Compute Totals & Discounts
+  const cartSubtotal = cart.reduce((sum, item) => {
+    return sum + (Number(item.price || 0) * Number(item.quantity || 1));
+  }, 0);
+  const finalShipping = getShippingForCart(cart, cartSubtotal);
+
+  const bundleInfo = await computeAny3BundleDiscount(cart);
+  const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
+  const couponDisc = Math.max(0, Number(couponDiscount || 0));
+
+  const calculatedOrderTotal = Math.max(
+    0,
+    cartSubtotal + Number(finalShipping.price) - couponDisc - bundleDisc
+  );
+  const paidAmount = Number(razorpayOrder?.amount_paid || razorpayOrder?.amount || customerData.amount || 0) / 100;
+  const orderTotal = Number.isFinite(paidAmount) && paidAmount > 0
+    ? paidAmount
+    : calculatedOrderTotal;
+
+  const discountCodesPayload = [];
+  if (couponCode && Number(couponDiscount) > 0) {
+    discountCodesPayload.push({
+      code: String(couponCode),
+      amount: Number(couponDiscount).toFixed(2),
+      type: "fixed_amount",
+    });
+  }
+  if (bundleDisc > 0) {
+    discountCodesPayload.push({
+      code: "AUTO_BUNDLE_ANY3_1500",
+      amount: bundleDisc.toFixed(2),
+      type: "fixed_amount",
+    });
+  }
+
+  // 4. Duplicate Check in Shopify (Avoid creating two orders for same payment ID)
+  try {
+    const existingOrder = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    const matchedShopifyOrder = existingOrder.data.orders.find(o =>
+      (razorpay_payment_id && o.note?.includes(razorpay_payment_id)) ||
+      (razorpay_order_id && o.note?.includes(razorpay_order_id))
+    );
+
+    if (matchedShopifyOrder) {
+      if (dbOrder) {
+        dbOrder.status = "shopify_created";
+        dbOrder.shopify_order_id = String(matchedShopifyOrder.id);
+        dbOrder.shopify_order_number = String(matchedShopifyOrder.name);
+        dbOrder.shopify_order_data = matchedShopifyOrder;
+        dbOrder.updated_at = new Date();
+        await dbOrder.save();
+      }
+      return {
+        success: true,
+        order: matchedShopifyOrder,
+        message: "Order already created",
+      };
+    }
+  } catch (chkErr) {
+    console.warn("[Order Engine] Shopify duplicate check note (proceeding):", chkErr.message);
+  }
+
+  // 5. Lookup Customer ID by Email and Phone to prevent Duplicate Phone errors
+  const shopifyCustomerId = await getShopifyCustomerId(email, phone);
+  const normalizedPhone = normalizePhoneE164(phone, "IN");
+
+  // 6. Build Order Payload
+  const orderPayload = {
+    order: {
+      line_items: cart.map(item => ({
+        variant_id: toNumericId(item.variant_id),
+        quantity: item.quantity,
+      })),
+      financial_status: "paid",
+      customer: shopifyCustomerId
+        ? { id: shopifyCustomerId }
+        : {
+            first_name,
+            last_name,
+            ...(email ? { email } : {}),
+            ...(normalizedPhone ? { phone: normalizedPhone } : {}),
+          },
+      ...(email ? { email } : {}),
+      ...(normalizedPhone ? { phone: normalizedPhone } : {}),
+      billing_address: {
+        first_name,
+        last_name,
+        address1,
+        address2,
+        city,
+        province: province,
+        country: country || "India",
+        zip: pincode,
+        ...(normalizedPhone ? { phone: normalizedPhone } : {}),
+      },
+      shipping_address: {
+        first_name,
+        last_name,
+        address1,
+        address2,
+        city,
+        province: province,
+        country: country || "India",
+        zip: pincode,
+        ...(normalizedPhone ? { phone: normalizedPhone } : {}),
+      },
+      shipping_lines: [
+        {
+          title: finalShipping.title,
+          price: finalShipping.price,
+          code: finalShipping.code,
+        },
+      ],
+      discount_codes: discountCodesPayload,
+      transactions: [
+        {
+          kind: "sale",
+          status: "success",
+          amount: orderTotal.toFixed(2),
+          gateway: "Razorpay",
+        },
+      ],
+      tags: "razorpay,mobile_app",
+      gateway: "Razorpay",
+      note: `Razorpay Payment ID: ${razorpay_payment_id || ""} | Order ID: ${razorpay_order_id}`,
+      note_attributes: [
+        { name: "Payment ID", value: String(razorpay_payment_id || "") },
+        { name: "Order ID", value: String(razorpay_order_id) },
+        { name: "Customer Phone", value: normalizedPhone || String(phone || "") },
+        { name: "Receipt", value: String(razorpayOrder?.receipt || "") },
+        ...(couponCode ? [
+          { name: "Coupon Code", value: String(couponCode) },
+          { name: "Coupon Discount", value: String(couponDiscount || 0) },
+        ] : []),
+        ...(bundleDisc > 0 ? [
+          { name: "Bundle Discount", value: String(bundleDisc.toFixed(2)) },
+          { name: "Bundle Offer", value: `Any ${BUNDLE_ANY3_QTY} @ ${BUNDLE_ANY3_PRICE}` },
+        ] : []),
+        { name: "Shipping Amount", value: String(finalShipping.price) },
+        { name: "Final Payable", value: String(orderTotal.toFixed(2)) },
+        ...(totalMrp !== undefined && totalMrp !== null ? [{ name: "Total MRP", value: String(totalMrp) }] : []),
+        ...(productDiscount !== undefined && productDiscount !== null ? [{ name: "Product Discount", value: String(productDiscount) }] : []),
+      ],
+      metafields: [
+        {
+          namespace: "custom",
+          key: "razorpay_payment_id",
+          value: String(razorpay_payment_id || ""),
+          type: "single_line_text_field",
+        },
+        {
+          namespace: "custom",
+          key: "razorpay_order_id",
+          value: String(razorpay_order_id),
+          type: "single_line_text_field",
+        },
+        {
+          namespace: "custom",
+          key: "cart_data",
+          value: JSON.stringify(cart),
+          type: "json",
+        },
+      ],
+      processing_method: "direct",
+    },
+  };
+
+  // 7. Create Order in Shopify
+  const shopifyOrderResponse = await axios.post(
+    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
+    orderPayload,
+    {
+      headers: {
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+    }
+  );
+
+  const createdOrder = shopifyOrderResponse.data.order;
+
+  // 8. Update MongoDB Record
+  try {
+    if (dbOrder) {
+      dbOrder.status = "shopify_created";
+      dbOrder.razorpay_payment_id = razorpay_payment_id || dbOrder.razorpay_payment_id;
+      dbOrder.razorpay_signature = razorpay_signature || dbOrder.razorpay_signature;
+      dbOrder.shopify_order_id = String(createdOrder.id);
+      dbOrder.shopify_order_number = String(createdOrder.name);
+      dbOrder.shopify_order_data = createdOrder;
+      dbOrder.updated_at = new Date();
+      await dbOrder.save();
+    } else {
+      await Order.create({
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+        status: "shopify_created",
+        amount: orderTotal,
+        cart,
+        email,
+        phone,
+        first_name,
+        last_name,
+        shipping_address: { address1, address2, city, province, country, zip: pincode },
+        shopify_order_id: String(createdOrder.id),
+        shopify_order_number: String(createdOrder.name),
+        shopify_order_data: createdOrder,
+      });
+    }
+  } catch (saveErr) {
+    console.error("[Order Engine] MongoDB order save error:", saveErr.message);
+  }
+
+  console.log(`[Order Engine] Successfully created Shopify order ${createdOrder.name} (ID: ${createdOrder.id}) for Razorpay Order ${razorpay_order_id}`);
+
+  return {
+    success: true,
+    order: createdOrder,
+  };
+}
+
 /* ------------------ VERIFY PAYMENT ------------------ */
 
 app.post("/api/payment/verify", async (req, res) => {
@@ -3516,7 +3916,7 @@ app.post("/api/payment/verify", async (req, res) => {
       couponDiscount,
       shippingAmount,
       totalMrp,
-      productDiscount
+      productDiscount,
     } = req.body;
 
     /* ------------------ VERIFY SIGNATURE ------------------ */
@@ -3532,204 +3932,61 @@ app.post("/api/payment/verify", async (req, res) => {
       return res.json({ success: false, message: "Invalid signature" });
     }
 
-    /* ------------------ FETCH RAZORPAY ORDER (SECURITY FIX) ------------------ */
+    /* ------------------ PROCESS & CREATE SHOPIFY ORDER ------------------ */
 
-    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
-
-    const cart = JSON.parse(razorpayOrder.notes.cart || "[]");
-    const cartSubtotal = cart.reduce((sum, item) => {
-      return sum + (Number(item.price || 0) * Number(item.quantity || 1));
-    }, 0);
-    const finalShipping = getShippingForCart(cart, cartSubtotal);
-
-    const bundleInfo = await computeAny3BundleDiscount(cart);
-    const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
-
-    const couponDisc = Math.max(0, Number(couponDiscount || 0));
-    const calculatedOrderTotal = Math.max(
-      0,
-      cartSubtotal + Number(finalShipping.price) - couponDisc - bundleDisc
-    );
-    const paidAmount = Number(razorpayOrder.amount_paid || razorpayOrder.amount || amount || 0) / 100;
-    const orderTotal = Number.isFinite(paidAmount) && paidAmount > 0
-      ? paidAmount
-      : calculatedOrderTotal;
-
-    const discountCodesPayload = [];
-
-    // Add coupon discount if applied
-    if (couponCode && Number(couponDiscount) > 0) {
-      discountCodesPayload.push({
-        code: String(couponCode),
-        amount: Number(couponDiscount).toFixed(2),
-        type: "fixed_amount",
-      });
-    }
-
-    // Add automatic bundle discount (for Shopify order totals)
-    if (bundleDisc > 0) {
-      discountCodesPayload.push({
-        code: "AUTO_BUNDLE_ANY3_1500",
-        amount: bundleDisc.toFixed(2),
-        type: "fixed_amount",
-      });
-    }
-
-    /* ------------------ PREVENT DUPLICATE ORDER ------------------ */
-
-   const existingOrder = await axios.get(
-  `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json?status=any&limit=50`,
-  {
-    headers: {
-      "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-    },
-  }
-); 
-
-    const alreadyExists = existingOrder.data.orders.some(o =>
-      o.note?.includes(razorpay_payment_id)
-    );
-
-    if (alreadyExists) {
-      return res.json({ success: true, message: "Order already created" });
-    }
-
-    /* ------------------ CREATE SHOPIFY ORDER ------------------ */
-
-    const shopifyCustomerId = await getShopifyCustomerIdByEmail(email);
-    const normalizedPhone = normalizePhoneE164(phone, "IN");
-
-    const shopifyOrder = await axios.post(
-      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
-      {
-        order: {
-  line_items: cart.map(item => ({
-    variant_id: toNumericId(item.variant_id),
-    quantity: item.quantity,
-  })),
-
-  financial_status: "paid",
-
-  customer: shopifyCustomerId ? { id: shopifyCustomerId } : {
-    first_name,
-    last_name,
-    email,
-    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
-  },
-
-  email,
-
-  billing_address: {
-    first_name,
-    last_name,
-    address1,
-    address2,
-    city,
-    province: province || state,
-    country: country || "India",
-    zip: pincode,
-    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
-  },
-
-  shipping_address: {
-    first_name,
-    last_name,
-    address1,
-    address2,
-    city,
-    province: province || state,
-    country: country || "India",
-    zip: pincode,
-    ...(normalizedPhone ? { phone: normalizedPhone } : {}),
-  },
-
-  shipping_lines: [
-    {
-      title: finalShipping.title,
-      price: finalShipping.price,
-      code:  finalShipping.code,
-    },
-  ],
-
-  discount_codes: discountCodesPayload,
-
-  transactions: [
-    {
-      kind: "sale",
-      status: "success",
-      amount: orderTotal.toFixed(2),
-      gateway: "Razorpay",
-    },
-  ],
-
-  tags: "razorpay,upi",
-
-  gateway: "Razorpay",
-
-  /* ✅ VERY IMPORTANT ADDITIONS BELOW */
-
-  note: `Razorpay Payment ID: ${razorpay_payment_id}`,
-
-  note_attributes: [
-    { name: "Payment ID", value: razorpay_payment_id },
-    { name: "Order ID", value: razorpay_order_id },
-    { name: "Customer Phone", value: normalizedPhone || String(phone || "") },
-    { name: "Receipt", value: razorpayOrder.receipt },
-    ...(couponCode ? [
-      { name: "Coupon Code", value: String(couponCode) },
-      { name: "Coupon Discount", value: String(couponDiscount || 0) },
-    ] : []),
-    ...(bundleDisc > 0 ? [
-      { name: "Bundle Discount", value: String(bundleDisc.toFixed(2)) },
-      { name: "Bundle Offer", value: `Any ${BUNDLE_ANY3_QTY} @ ${BUNDLE_ANY3_PRICE}` },
-    ] : []),
-    { name: "Shipping Amount", value: String(finalShipping.price) },
-    { name: "Final Payable", value: String(orderTotal.toFixed(2)) },
-    ...(totalMrp !== undefined && totalMrp !== null ? [{ name: "Total MRP", value: String(totalMrp) }] : []),
-    ...(productDiscount !== undefined && productDiscount !== null ? [{ name: "Product Discount", value: String(productDiscount) }] : []),
-  ],
-
-  metafields: [
-    {
-      namespace: "custom",
-      key: "razorpay_payment_id",
-      value: razorpay_payment_id,
-      type: "single_line_text_field",
-    },
-    {
-      namespace: "custom",
-      key: "cart_data",
-      value: JSON.stringify(cart),
-      type: "json",
-    },
-  ],
-
-  processing_method: "direct",
-},
+    const result = await processAndCreateShopifyOrder({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      customerData: {
+        first_name,
+        last_name,
+        email,
+        phone,
+        address1,
+        address2,
+        city,
+        province: province || state,
+        country: country || "India",
+        pincode,
+        amount,
+        couponCode,
+        couponDiscount,
+        shippingAmount,
+        totalMrp,
+        productDiscount,
       },
-      {
-        headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-        },
-      }
-    );
-
-    res.json({
-      success: true,
-      order: shopifyOrder.data.order,
     });
+
+    res.json(result);
 
   } catch (err) {
     const info = errorInfo(err);
     const shopifyStatus = err?.response?.status ?? null;
     const shopifyData = err?.response?.data ?? null;
 
-    console.error("FULL ERROR:", info);
+    console.error("ORDER VERIFY FULL ERROR:", info);
     if (shopifyStatus || shopifyData) {
       console.error("SHOPIFY ERROR DETAILS:", {
         status: shopifyStatus,
         data: shopifyData,
       });
+    }
+
+    // Log failure in MongoDB if record exists
+    if (req.body?.razorpay_order_id) {
+      try {
+        await Order.updateOne(
+          { razorpay_order_id: req.body.razorpay_order_id },
+          {
+            status: "failed",
+            error_log: JSON.stringify(shopifyData || info.message),
+            updated_at: new Date(),
+          }
+        );
+      } catch (logErr) {
+        console.error("[Order Verify] Failed to record error in MongoDB:", logErr.message);
+      }
     }
 
     const details =
@@ -3744,6 +4001,62 @@ app.post("/api/payment/verify", async (req, res) => {
       details,
     });
   } 
+});
+
+/* ------------------ RAZORPAY WEBHOOK ------------------ */
+
+app.post("/api/payment/webhook", async (req, res) => {
+  try {
+    const signature = req.headers["x-razorpay-signature"];
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET;
+
+    if (signature && webhookSecret) {
+      const rawBody = typeof req.rawBody === "string" 
+        ? req.rawBody 
+        : JSON.stringify(req.body);
+
+      const expectedSignature = crypto
+        .createHmac("sha256", webhookSecret)
+        .update(rawBody)
+        .digest("hex");
+
+      if (expectedSignature !== signature) {
+        console.warn("[Webhook] Invalid signature received on Razorpay webhook");
+        return res.status(400).json({ error: "Invalid signature" });
+      }
+    }
+
+    const event = req.body.event;
+    console.log(`[Webhook] Received Razorpay event: ${event}`);
+
+    if (event === "order.paid" || event === "payment.captured") {
+      const paymentEntity = req.body.payload?.payment?.entity;
+      const orderEntity = req.body.payload?.order?.entity;
+
+      const razorpay_order_id = paymentEntity?.order_id || orderEntity?.id;
+      const razorpay_payment_id = paymentEntity?.id;
+
+      if (razorpay_order_id) {
+        console.log(`[Webhook] Processing order for ${razorpay_order_id} (Payment: ${razorpay_payment_id})`);
+        processAndCreateShopifyOrder({
+          razorpay_order_id,
+          razorpay_payment_id,
+          customerData: {
+            email: paymentEntity?.email,
+            phone: paymentEntity?.contact,
+          },
+        }).catch(err => {
+          console.error("[Webhook] Background order creation error:", err.message);
+        });
+      }
+    }
+
+    // Always respond 200 OK to Razorpay so they don't retry
+    res.status(200).json({ status: "ok" });
+  } catch (err) {
+    console.error("[Webhook Error]:", err);
+    res.status(500).json({ error: "Webhook processing error" });
+  }
 });
 
  
