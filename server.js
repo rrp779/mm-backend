@@ -21,6 +21,7 @@ const PDFDocument = require("pdfkit");
 const NodeCache = require("node-cache");
 const cache = new NodeCache({ stdTTL: 60 });  
 const Review = require("./models/Review");
+const { sendOrderNotification } = require("./services/notificationService");
 
 const RAZORPAY_KEY_ID = String(process.env.RAZORPAY_KEY_ID || "").trim();
 const RAZORPAY_KEY_SECRET = String(process.env.RAZORPAY_KEY_SECRET || "").trim();
@@ -954,6 +955,9 @@ app.use(express.json({
     req.rawBody = buf.toString();
   }
 }));
+
+app.use("/api/notifications", require("./routes/notificationRoutes"));
+app.use("/api/webhooks", require("./routes/webhookRoutes"));
 
 app.use((req, res, next) => {
   res.locals.reqId = res.locals.reqId || newReqId();
@@ -3885,6 +3889,24 @@ async function processAndCreateShopifyOrder({
 
   console.log(`[Order Engine] Successfully created Shopify order ${createdOrder.name} (ID: ${createdOrder.id}) for Razorpay Order ${razorpay_order_id}`);
 
+  // Automated Push Notification: Order Placed
+  sendOrderNotification({
+    orderId: String(createdOrder.id),
+    orderNumber: createdOrder.name || String(createdOrder.order_number || createdOrder.id),
+    status: "order_placed",
+    customerId: createdOrder.customer?.id
+      ? String(createdOrder.customer.id)
+      : (shopifyCustomerId ? String(shopifyCustomerId) : null),
+    email: email || createdOrder.customer?.email || createdOrder.email || "",
+    phone: phone || createdOrder.customer?.phone || createdOrder.phone || "",
+    additionalData: {
+      razorpay_order_id,
+      razorpay_payment_id: razorpay_payment_id || "",
+    },
+  }).catch((notifErr) =>
+    console.error("[Order Engine] Notification trigger error:", notifErr.message)
+  );
+
   return {
     success: true,
     order: createdOrder,
@@ -3929,6 +3951,14 @@ app.post("/api/payment/verify", async (req, res) => {
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
+      if (razorpay_order_id) {
+        sendOrderNotification({
+          orderId: razorpay_order_id,
+          status: "payment_failed",
+          email,
+          phone,
+        }).catch((e) => console.error("[Payment Failed Notif Error]:", e.message));
+      }
       return res.json({ success: false, message: "Invalid signature" });
     }
 
@@ -3973,8 +4003,15 @@ app.post("/api/payment/verify", async (req, res) => {
       });
     }
 
-    // Log failure in MongoDB if record exists
+    // Log failure in MongoDB if record exists & trigger payment_failed notification
     if (req.body?.razorpay_order_id) {
+      sendOrderNotification({
+        orderId: req.body.razorpay_order_id,
+        status: "payment_failed",
+        email: req.body?.email,
+        phone: req.body?.phone,
+      }).catch((e) => console.error("[Payment Failed Notif Error]:", e.message));
+
       try {
         await Order.updateOne(
           { razorpay_order_id: req.body.razorpay_order_id },
@@ -4001,6 +4038,29 @@ app.post("/api/payment/verify", async (req, res) => {
       details,
     });
   } 
+});
+
+/* ------------------ PAYMENT FAILED CLIENT REPORT ------------------ */
+
+app.post("/api/payment/failed", async (req, res) => {
+  try {
+    const { razorpay_order_id, error_code, error_description, email, phone } = req.body;
+    if (razorpay_order_id) {
+      sendOrderNotification({
+        orderId: razorpay_order_id,
+        status: "payment_failed",
+        email,
+        phone,
+        additionalData: {
+          error_code: String(error_code || ""),
+          error_description: String(error_description || ""),
+        },
+      }).catch((e) => console.error("[Payment Failed Notif Error]:", e.message));
+    }
+    return res.json({ success: true, message: "Payment failure logged and notification queued" });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to record payment failure" });
+  }
 });
 
 /* ------------------ RAZORPAY WEBHOOK ------------------ */
