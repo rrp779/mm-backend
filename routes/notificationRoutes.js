@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const DeviceToken = require("../models/DeviceToken");
 const NotificationLog = require("../models/NotificationLog");
-const { sendOrderNotification } = require("../services/notificationService");
+const { sendOrderNotification, sendBroadcastNotification } = require("../services/notificationService");
 
 /**
  * Register or update device FCM token
@@ -62,14 +62,14 @@ router.post("/unregister-token", async (req, res) => {
 });
 
 /**
- * Fetch notification history for a customer
+ * Fetch notification history for a customer (including promotional broadcasts)
  * GET /api/notifications/history?phone=...&email=...
  */
 router.get("/history", async (req, res) => {
   try {
-    const { phone, email, customerId, limit = 20, page = 1 } = req.query;
+    const { phone, email, customerId, limit = 50, page = 1 } = req.query;
 
-    const queryConditions = [];
+    const queryConditions = [{ isBroadcast: true }];
     if (customerId) queryConditions.push({ customerId: String(customerId).trim() });
     if (email) queryConditions.push({ email: String(email).trim().toLowerCase() });
     if (phone) {
@@ -78,10 +78,6 @@ router.get("/history", async (req, res) => {
       if (cleanPhone.length >= 10) {
         queryConditions.push({ phone: { $regex: cleanPhone.slice(-10) + "$" } });
       }
-    }
-
-    if (queryConditions.length === 0) {
-      return res.status(400).json({ error: "Customer identifier required (phone, email, or customerId)" });
     }
 
     const skip = (Math.max(1, parseInt(page, 10)) - 1) * parseInt(limit, 10);
@@ -99,6 +95,61 @@ router.get("/history", async (req, res) => {
   } catch (error) {
     console.error("[Notification Routes] Error fetching history:", error);
     return res.status(500).json({ error: "Failed to fetch notification history" });
+  }
+});
+
+/**
+ * Broadcast promotional or flash sale notification to all users or topic subscribers
+ * POST /api/notifications/broadcast
+ * Body: {
+ *   title: "⚡ Flash Sale: Flat 50% OFF!",
+ *   body: "Hurry! Sale live for next 60 minutes only.",
+ *   imageUrl: "https://...",
+ *   topic: "promotions" | "flash_sales" | "all_users",
+ *   type: "collection" | "product" | "cart",
+ *   handle: "flash-deals",
+ *   status: "flash_sale" | "promotional",
+ *   discountCode: "FLASH50"
+ * }
+ */
+router.post("/broadcast", async (req, res) => {
+  try {
+    const {
+      title,
+      body,
+      imageUrl,
+      topic = "promotions",
+      type = "collection",
+      handle = "",
+      status = "flash_sale",
+      discountCode,
+    } = req.body;
+
+    if (!title || !body) {
+      return res.status(400).json({ error: "title and body are required for broadcast" });
+    }
+
+    const result = await sendBroadcastNotification({
+      title,
+      body,
+      imageUrl,
+      topic,
+      status,
+      deepLink: {
+        type,
+        handle,
+        title,
+      },
+      additionalData: discountCode ? { discount_code: discountCode } : {},
+    });
+
+    return res.status(200).json({
+      success: true,
+      result,
+    });
+  } catch (error) {
+    console.error("[Notification Routes] Error sending broadcast:", error);
+    return res.status(500).json({ error: error.message });
   }
 });
 

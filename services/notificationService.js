@@ -260,7 +260,157 @@ async function sendOrderNotification({
   }
 }
 
+/**
+ * Send broadcast / promotional push notification to an FCM topic
+ * @param {Object} params
+ * @param {string} params.title - Notification headline (e.g. "⚡ 1-HOUR FLASH SALE!")
+ * @param {string} params.body - Notification body
+ * @param {string} [params.imageUrl] - Big picture banner URL for notification drawer
+ * @param {string} [params.topic="promotions"] - Target FCM topic ('all_users', 'promotions', 'flash_sales')
+ * @param {string} [params.status="flash_sale"] - 'flash_sale' or 'promotional'
+ * @param {Object} [params.deepLink] - { type: 'collection'|'product'|'cart', handle: string, title: string }
+ * @param {Object} [params.additionalData] - Extra metadata key-values
+ */
+async function sendBroadcastNotification({
+  title,
+  body,
+  imageUrl,
+  topic = "promotions",
+  status = "flash_sale",
+  deepLink = {},
+  additionalData = {},
+}) {
+  if (!title || !body) {
+    throw new Error("title and body are required for broadcast notification");
+  }
+
+  const cleanTitle = String(title).trim();
+  const cleanBody = String(body).trim();
+  const cleanTopic = String(topic || "promotions").trim().replace(/[^a-zA-Z0-9-_.~%]/g, "_");
+  const cleanImageUrl = imageUrl && typeof imageUrl === "string" && imageUrl.trim() ? imageUrl.trim() : null;
+
+  const deepLinkType = String(deepLink.type || additionalData.type || "collection").toLowerCase();
+  const deepLinkHandle = String(deepLink.handle || additionalData.handle || "");
+  const deepLinkTitle = String(deepLink.title || additionalData.title || cleanTitle);
+
+  const dataPayload = {
+    type: deepLinkType,
+    handle: deepLinkHandle,
+    title: deepLinkTitle,
+    status: status,
+    is_broadcast: "true",
+    topic: cleanTopic,
+    image_url: cleanImageUrl || "",
+    click_action: "FLUTTER_NOTIFICATION_CLICK",
+    ...Object.fromEntries(
+      Object.entries(additionalData).map(([k, v]) => [k, String(v ?? "")])
+    ),
+  };
+
+  const notificationPayload = {
+    title: cleanTitle,
+    body: cleanBody,
+  };
+  if (cleanImageUrl) {
+    notificationPayload.imageUrl = cleanImageUrl;
+  }
+
+  const fcmMessage = {
+    topic: cleanTopic,
+    notification: notificationPayload,
+    data: dataPayload,
+    android: {
+      priority: "high",
+      notification: {
+        channelId: "high_importance_channel",
+        priority: "max",
+        defaultSound: true,
+        ...(cleanImageUrl ? { imageUrl: cleanImageUrl } : {}),
+      },
+    },
+    apns: {
+      headers: {
+        "apns-priority": "10",
+      },
+      payload: {
+        aps: {
+          alert: {
+            title: cleanTitle,
+            body: cleanBody,
+          },
+          sound: "default",
+          badge: 1,
+          mutableContent: true,
+        },
+      },
+      ...(cleanImageUrl
+        ? {
+            fcmOptions: {
+              imageUrl: cleanImageUrl,
+            },
+          }
+        : {}),
+    },
+  };
+
+  let fcmMessageId = null;
+  let success = false;
+  const messaging = getMessagingInstance();
+
+  if (isFirebaseReady() && messaging) {
+    try {
+      fcmMessageId = await messaging.send(fcmMessage);
+      success = true;
+      console.log(`[Notification Service] 📢 Broadcast sent to topic '${cleanTopic}':`, fcmMessageId);
+    } catch (fcmErr) {
+      console.error(`[Notification Service] ❌ FCM Broadcast Error for topic '${cleanTopic}':`, fcmErr.message);
+    }
+  } else {
+    console.warn(`[Notification Service] ⚠️ Firebase not ready, logging broadcast locally`);
+  }
+
+  // Save in MongoDB NotificationLog as broadcast so it appears in users' Notification Center
+  try {
+    const broadcastId = `PROMO_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const logEntry = await NotificationLog.create({
+      orderId: broadcastId,
+      orderNumber: deepLinkType === "collection" ? (deepLinkHandle || "PROMO") : "PROMO",
+      status: status,
+      isBroadcast: true,
+      topic: cleanTopic,
+      imageUrl: cleanImageUrl,
+      title: cleanTitle,
+      body: cleanBody,
+      data: dataPayload,
+      sentTokensCount: 1,
+      successTokensCount: success ? 1 : 0,
+      failureTokensCount: success ? 0 : 1,
+      sentAt: new Date(),
+    });
+
+    return {
+      success: true,
+      broadcastId,
+      logId: logEntry._id,
+      topic: cleanTopic,
+      fcmMessageId,
+      title: cleanTitle,
+      body: cleanBody,
+      imageUrl: cleanImageUrl,
+    };
+  } catch (logErr) {
+    console.error("[Notification Service] Error creating broadcast log:", logErr.message);
+    return {
+      success: true,
+      warning: "Log creation failed",
+      topic: cleanTopic,
+      fcmMessageId,
+    };
+  }
+}
+
 module.exports = {
   sendOrderNotification,
+  sendBroadcastNotification,
   DEFAULT_TEMPLATES,
 };

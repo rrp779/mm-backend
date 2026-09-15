@@ -4,7 +4,8 @@ const notificationLogSchema = new mongoose.Schema(
   {
     orderId: {
       type: String,
-      required: true,
+      required: false,
+      default: "",
       index: true,
       trim: true,
     },
@@ -26,8 +27,25 @@ const notificationLogSchema = new mongoose.Schema(
         "order_refunded",
         "payment_failed",
         "custom",
+        "promotional",
+        "flash_sale",
       ],
       index: true,
+    },
+    isBroadcast: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    topic: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    imageUrl: {
+      type: String,
+      trim: true,
+      default: null,
     },
     customerId: {
       type: String,
@@ -78,7 +96,10 @@ const notificationLogSchema = new mongoose.Schema(
   }
 );
 
-// Compound index to strictly enforce deduplication: one notification per order per status
-notificationLogSchema.index({ orderId: 1, status: 1 }, { unique: true });
+// Compound index to strictly enforce deduplication for orders (broadcasts exempted)
+notificationLogSchema.index(
+  { orderId: 1, status: 1 },
+  { unique: true, partialFilterExpression: { isBroadcast: { $ne: true } } }
+);
 
 module.exports = mongoose.model("NotificationLog", notificationLogSchema);
