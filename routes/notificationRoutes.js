@@ -138,7 +138,7 @@ router.post("/broadcast", async (req, res) => {
       deepLink: {
         type,
         handle,
-        title,
+        title: req.body.screenTitle || (status === "flash_sale" ? "⚡ Flash Sale" : title),
       },
       additionalData: discountCode ? { discount_code: discountCode } : {},
     });
