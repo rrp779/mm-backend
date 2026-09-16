@@ -3420,39 +3420,50 @@ async function sendWhatsAppOtpMessage(phone, otp) {
     throw new Error("WhatsApp credentials are not configured");
   }
 
-  await axios.post(
-    `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`,
-    {
-      messaging_product: "whatsapp",
-      to: phone.replace(/^\+/, ""),
-      type: "template",
-      template: {
-        name: template,
-        language: { code: language },
-        components: [
-          {
-            type: "body",
-            parameters: [{ type: "text", text: otp }],
-          },
-          {
-            type: "button",
-            sub_type: "url",
-            index: "0",
-            parameters: [{ type: "text", text: otp }],
-          },
-        ],
+  try {
+    await axios.post(
+      `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: phone.replace(/^\+/, ""),
+        type: "template",
+        template: {
+          name: template,
+          language: { code: language },
+          components: [
+            {
+              type: "body",
+              parameters: [{ type: "text", text: otp }],
+            },
+            {
+              type: "button",
+              sub_type: "url",
+              index: "0",
+              parameters: [{ type: "text", text: otp }],
+            },
+          ],
+        },
       },
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      timeout: 15000,
-    }
-  );
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 15000,
+      }
+    );
 
-  return {};
+    return {};
+  } catch (err) {
+    const allowDevOtp =
+      isTruthyEnv(process.env.ALLOW_DEV_OTP) ||
+      String(process.env.NODE_ENV || "").trim().toLowerCase() !== "production";
+    if (allowDevOtp) {
+      console.warn("WhatsApp send failed, falling back to devOtp:", errorInfo(err));
+      return { devOtp: otp };
+    }
+    throw err;
+  }
 }
 
 app.post("/api/auth/whatsapp/send-otp", async (req, res) => {
