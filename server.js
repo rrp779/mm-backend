@@ -3413,8 +3413,8 @@ async function sendWhatsAppOtpMessage(phone, otp) {
   const apiVersion = process.env.WHATSAPP_API_VERSION || "v20.0";
 
   if (!token || !phoneNumberId) {
-    console.warn("WhatsApp credentials not configured, falling back to devOtp");
-    return { devOtp: otp, fallback: true };
+    console.warn("WhatsApp credentials not configured");
+    return { deliveryFailed: true, error: "WhatsApp credentials not configured on server" };
   }
 
   try {
@@ -3450,13 +3450,14 @@ async function sendWhatsAppOtpMessage(phone, otp) {
       }
     );
 
-    return { devOtp: otp };
+    console.log(`[WhatsApp] OTP sent successfully to ${phone}`);
+    return { success: true };
   } catch (err) {
-    console.warn("WhatsApp send failed, falling back to devOtp:", errorInfo(err));
+    const metaErrorMsg = err?.response?.data?.error?.message || err.message;
+    console.warn("WhatsApp send failed:", metaErrorMsg);
     return {
-      devOtp: otp,
       deliveryFailed: true,
-      error: err?.response?.data?.error?.message || err.message,
+      error: metaErrorMsg,
     };
   }
 }
@@ -3481,10 +3482,16 @@ app.post("/api/auth/whatsapp/send-otp", async (req, res) => {
 
     const sendResult = await sendWhatsAppOtpMessage(phone, otp);
 
+    if (sendResult.deliveryFailed) {
+      return res.status(502).json({
+        success: false,
+        message: `WhatsApp OTP delivery failed (${sendResult.error || "Meta WhatsApp service error"}). Please contact support or update WhatsApp API credentials.`,
+      });
+    }
+
     return res.json({
       success: true,
-      message: sendResult.deliveryFailed ? "WhatsApp service unavailable. Test OTP provided." : "OTP sent on WhatsApp",
-      devOtp: sendResult.devOtp || otp,
+      message: "OTP sent to your WhatsApp",
     });
   } catch (err) {
     console.error("WhatsApp OTP send error:", errorInfo(err));
@@ -3646,18 +3653,22 @@ app.post("/api/auth/forgot-password/send-otp", async (req, res) => {
 
     const sendResult = await sendWhatsAppOtpMessage(phone, otp);
 
+    if (sendResult.deliveryFailed) {
+      return res.status(502).json({
+        success: false,
+        message: `WhatsApp OTP delivery failed (${sendResult.error || "Meta WhatsApp service error"}). Please check WhatsApp service credentials.`,
+      });
+    }
+
     const maskedPhone = phone.length >= 10
       ? `${phone.slice(0, phone.length - 4).replace(/./g, "*")}${phone.slice(-4)}`
       : phone;
 
     return res.json({
       success: true,
-      message: sendResult.deliveryFailed
-        ? `WhatsApp delivery unavailable. Use OTP: ${otp}`
-        : `OTP sent to your WhatsApp number ending in ${phone.slice(-4)}`,
+      message: `OTP sent to your WhatsApp number ending in ${phone.slice(-4)}`,
       phone,
       maskedPhone,
-      devOtp: sendResult.devOtp || otp,
     });
   } catch (err) {
     console.error("Forgot password OTP send error:", errorInfo(err));
