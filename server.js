@@ -610,12 +610,34 @@ async function getShopifyCustomerByPhone(phone) {
   return null;
 }
 
+async function getShopifyCustomerByEmail(email) {
+  if (!email) return null;
+  try {
+    const query = encodeURIComponent(`email:${String(email).trim().toLowerCase()}`);
+    const response = await axios.get(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/search.json?query=${query}`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    if (response?.data?.customers?.[0]) {
+      return response.data.customers[0];
+    }
+  } catch (err) {
+    console.error("Search customer by email failed:", err.message);
+  }
+  return null;
+}
+
 async function updateShopifyCustomerPassword(customerId, newPassword) {
+  const cleanId = String(customerId || "").replace(/^gid:\/\/shopify\/Customer\//, "");
   await axios.put(
-    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/${customerId}.json`,
+    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/${cleanId}.json`,
     {
       customer: {
-        id: customerId,
+        id: cleanId,
         password: newPassword,
         password_confirmation: newPassword,
       },
@@ -634,6 +656,33 @@ async function loginOtpCustomerWithRealEmail(email, phone) {
   const data = await shopifyStorefrontRequest(
     `
       mutation LoginOtpCustomer($input: CustomerAccessTokenCreateInput!) {
+        customerAccessTokenCreate(input: $input) {
+          customerAccessToken {
+            accessToken
+            expiresAt
+          }
+          customerUserErrors { message }
+        }
+      }
+    `,
+    {
+      input: { email, password },
+    }
+  );
+
+  const errors = data?.customerAccessTokenCreate?.customerUserErrors || [];
+  const token = data?.customerAccessTokenCreate?.customerAccessToken;
+  if (errors.length || !token) {
+    throw new Error(errors[0]?.message || "Unable to login customer");
+  }
+
+  return token;
+}
+
+async function loginCustomerWithStorefront(email, password) {
+  const data = await shopifyStorefrontRequest(
+    `
+      mutation LoginCustomer($input: CustomerAccessTokenCreateInput!) {
         customerAccessTokenCreate(input: $input) {
           customerAccessToken {
             accessToken
@@ -3512,6 +3561,237 @@ app.post("/api/auth/whatsapp/verify-otp", async (req, res) => {
   }
 });
 
+/* ------------------ FORGOT PASSWORD VIA OTP ------------------ */
+
+const FORGOT_PASSWORD_OTP_PREFIX = "forgot-otp:";
+const FORGOT_PASSWORD_TOKEN_PREFIX = "reset-token:";
+const FORGOT_PASSWORD_OTP_TTL_SEC = 600; // 10 minutes
+const FORGOT_PASSWORD_TOKEN_TTL_SEC = 900; // 15 minutes
+const FORGOT_PASSWORD_MAX_ATTEMPTS = 5;
+
+app.post("/api/auth/forgot-password/send-otp", async (req, res) => {
+  try {
+    const rawInput = String(req.body?.phone || req.body?.email || req.body?.identifier || "").trim();
+    if (!rawInput) {
+      return res.status(400).json({ success: false, message: "Please enter your mobile number or email" });
+    }
+
+    let phone = "";
+    let customer = null;
+
+    if (rawInput.includes("@")) {
+      customer = await getShopifyCustomerByEmail(rawInput);
+      if (!customer) {
+        return res.status(404).json({
+          success: false,
+          message: "No account found with this email address. Please check and try again.",
+        });
+      }
+      if (customer.phone) {
+        phone = normalizeIndianPhone(customer.phone);
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: "No mobile number is linked to this account. Please contact support or login using email.",
+        });
+      }
+    } else {
+      phone = normalizeIndianPhone(rawInput);
+      if (!/^\+\d{10,15}$/.test(phone)) {
+        return res.status(400).json({ success: false, message: "Enter a valid 10-digit mobile number" });
+      }
+
+      customer = await getShopifyCustomerByPhone(phone);
+      if (!customer) {
+        customer = await getShopifyCustomerByEmail(makeOtpCustomerEmail(phone));
+      }
+
+      if (!customer) {
+        return res.status(404).json({
+          success: false,
+          message: "No account found with this mobile number. Please check the number or register.",
+        });
+      }
+    }
+
+    const otp = String(crypto.randomInt(100000, 1000000));
+    const cacheKey = `${FORGOT_PASSWORD_OTP_PREFIX}${phone}`;
+
+    cache.set(
+      cacheKey,
+      {
+        hash: hashOtp(phone, otp),
+        attempts: 0,
+        customerId: customer.id,
+        customerEmail: customer.email || makeOtpCustomerEmail(phone),
+        createdAt: Date.now(),
+      },
+      FORGOT_PASSWORD_OTP_TTL_SEC
+    );
+
+    const sendResult = await sendWhatsAppOtpMessage(phone, otp);
+
+    const maskedPhone = phone.length >= 10
+      ? `${phone.slice(0, phone.length - 4).replace(/./g, "*")}${phone.slice(-4)}`
+      : phone;
+
+    return res.json({
+      success: true,
+      message: `OTP sent to your WhatsApp number ending in ${phone.slice(-4)}`,
+      phone,
+      maskedPhone,
+      ...(sendResult.devOtp ? { devOtp: sendResult.devOtp } : {}),
+    });
+  } catch (err) {
+    console.error("Forgot password OTP send error:", errorInfo(err));
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Unable to send OTP. Please try again later.",
+    });
+  }
+});
+
+app.post("/api/auth/forgot-password/verify-otp", async (req, res) => {
+  try {
+    const rawPhone = req.body?.phone;
+    const phone = normalizeIndianPhone(rawPhone);
+    const otp = String(req.body?.otp || "").trim();
+
+    if (!/^\+\d{10,15}$/.test(phone) || !/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ success: false, message: "Enter a valid 6-digit OTP" });
+    }
+
+    const cacheKey = `${FORGOT_PASSWORD_OTP_PREFIX}${phone}`;
+    const entry = cache.get(cacheKey);
+
+    if (!entry) {
+      return res.status(400).json({
+        success: false,
+        message: "OTP expired or not found. Please request a new OTP.",
+      });
+    }
+
+    if (Number(entry.attempts || 0) >= FORGOT_PASSWORD_MAX_ATTEMPTS) {
+      cache.del(cacheKey);
+      return res.status(429).json({
+        success: false,
+        message: "Too many incorrect attempts. Please request a new OTP.",
+      });
+    }
+
+    const expected = String(entry.hash || "");
+    const actual = hashOtp(phone, otp);
+    const ok =
+      expected.length === actual.length &&
+      crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+
+    if (!ok) {
+      cache.set(
+        cacheKey,
+        { ...entry, attempts: Number(entry.attempts || 0) + 1 },
+        FORGOT_PASSWORD_OTP_TTL_SEC
+      );
+      return res.status(400).json({ success: false, message: "Incorrect OTP. Please try again." });
+    }
+
+    cache.del(cacheKey);
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    cache.set(
+      `${FORGOT_PASSWORD_TOKEN_PREFIX}${resetToken}`,
+      {
+        phone,
+        customerId: entry.customerId,
+        customerEmail: entry.customerEmail,
+        createdAt: Date.now(),
+      },
+      FORGOT_PASSWORD_TOKEN_TTL_SEC
+    );
+
+    return res.json({
+      success: true,
+      message: "OTP verified successfully",
+      resetToken,
+      phone,
+    });
+  } catch (err) {
+    console.error("Forgot password OTP verify error:", errorInfo(err));
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Unable to verify OTP. Please try again.",
+    });
+  }
+});
+
+app.post("/api/auth/forgot-password/reset-password", async (req, res) => {
+  try {
+    const resetToken = String(req.body?.resetToken || "").trim();
+    const newPassword = String(req.body?.newPassword || "").trim();
+
+    if (!resetToken) {
+      return res.status(400).json({ success: false, message: "Reset token is required." });
+    }
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters long.",
+      });
+    }
+
+    const tokenKey = `${FORGOT_PASSWORD_TOKEN_PREFIX}${resetToken}`;
+    const session = cache.get(tokenKey);
+
+    if (!session) {
+      return res.status(400).json({
+        success: false,
+        message: "Your reset session has expired. Please request a new OTP.",
+      });
+    }
+
+    const { customerId, customerEmail, phone } = session;
+
+    try {
+      await updateShopifyCustomerPassword(customerId, newPassword);
+    } catch (updateErr) {
+      console.error("Failed to update Shopify customer password:", errorInfo(updateErr));
+      return res.status(500).json({
+        success: false,
+        message: "Could not update password on store. Please try again.",
+      });
+    }
+
+    cache.del(tokenKey);
+
+    let loginToken = null;
+    const targetEmail = customerEmail || makeOtpCustomerEmail(phone);
+    try {
+      loginToken = await loginCustomerWithStorefront(targetEmail, newPassword);
+    } catch (loginErr) {
+      console.warn("Storefront auto-login after password reset warning:", errorInfo(loginErr));
+    }
+
+    return res.json({
+      success: true,
+      message: "Password reset successfully",
+      customer: loginToken
+        ? {
+            accessToken: loginToken.accessToken,
+            expiresAt: loginToken.expiresAt,
+            email: targetEmail,
+            phone: phone || null,
+            authProvider: "email",
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error("Forgot password reset error:", errorInfo(err));
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to reset password. Please try again.",
+    });
+  }
+});
 
 /* ------------------ CREATE PAYMENT ORDER ------------------ */
 
