@@ -20,8 +20,9 @@ const PDFDocument = require("pdfkit");
 
 const NodeCache = require("node-cache");
 const cache = new NodeCache({ stdTTL: 60 });  
-const Review = require("./models/Review");
 const { sendOrderNotification } = require("./services/notificationService");
+const gokwikService = require("./services/gokwikService");
+
 
 const RAZORPAY_KEY_ID = String(process.env.RAZORPAY_KEY_ID || "").trim();
 const RAZORPAY_KEY_SECRET = String(process.env.RAZORPAY_KEY_SECRET || "").trim();
@@ -3480,17 +3481,44 @@ app.post("/api/auth/whatsapp/send-otp", async (req, res) => {
       WHATSAPP_OTP_TTL_SEC
     );
 
+    // 1. If GoKwik / KwikEngage is configured, attempt sending OTP via KwikEngage WhatsApp
+    if (gokwikService.isConfigured()) {
+      const gokwikRes = await gokwikService.sendOtp(phone, otp);
+      if (gokwikRes.success) {
+        return res.json({
+          success: true,
+          provider: "kwikengage",
+          message: "OTP sent to your WhatsApp",
+        });
+      }
+      console.warn("[GoKwik] Send failed, falling back to direct Meta API...", gokwikRes.error);
+    }
+
+    // 2. Direct Meta WhatsApp API Fallback
+    cache.set(
+      otpCacheKey(phone),
+      {
+        provider: "direct",
+        hash: hashOtp(phone, otp),
+        attempts: 0,
+        createdAt: Date.now(),
+      },
+      WHATSAPP_OTP_TTL_SEC
+    );
+
+
     const sendResult = await sendWhatsAppOtpMessage(phone, otp);
 
     if (sendResult.deliveryFailed) {
       return res.status(502).json({
         success: false,
-        message: `WhatsApp OTP delivery failed (${sendResult.error || "Meta WhatsApp service error"}). Please contact support or update WhatsApp API credentials.`,
+        message: `WhatsApp OTP delivery failed (${sendResult.error || "WhatsApp service error"}). Please contact support.`,
       });
     }
 
     return res.json({
       success: true,
+      provider: "direct",
       message: "OTP sent to your WhatsApp",
     });
   } catch (err) {
@@ -3512,11 +3540,46 @@ app.post("/api/auth/whatsapp/verify-otp", async (req, res) => {
     const lastName = String(req.body?.lastName || "").trim();
     const verifyOnly = Boolean(req.body?.verifyOnly);
 
-    if (!/^\+\d{10,15}$/.test(phone) || !/^\d{6}$/.test(otp)) {
+    if (!/^\+\d{10,15}$/.test(phone) || !/^\d{4,6}$/.test(otp)) {
       return res.status(400).json({ success: false, message: "Invalid phone or OTP" });
     }
 
     const entry = cache.get(otpCacheKey(phone));
+    
+    // 1. If GoKwik was used or configured
+    if (entry?.provider === "gokwik" || gokwikService.isConfigured()) {
+      const gokwikVerify = await gokwikService.verifyOtp(phone, otp, entry?.requestId);
+      if (gokwikVerify.success && gokwikVerify.verified) {
+        cache.del(otpCacheKey(phone));
+
+        if (verifyOnly) {
+          return res.json({
+            success: true,
+            phone,
+            verified: true,
+            provider: "gokwik",
+          });
+        }
+
+        const token = await getOrCreateOtpCustomerToken({ phone, firstName, lastName });
+        return res.json({
+          success: true,
+          customer: {
+            accessToken: token.accessToken,
+            expiresAt: token.expiresAt,
+            phone,
+            authProvider: "whatsapp_gokwik",
+          },
+        });
+      } else if (!entry?.hash) {
+        return res.status(400).json({
+          success: false,
+          message: gokwikVerify.error || "Incorrect or expired OTP",
+        });
+      }
+    }
+
+    // 2. Direct Meta WhatsApp OTP verification
     if (!entry) {
       return res.status(400).json({ success: false, message: "OTP expired. Please request a new OTP." });
     }
@@ -3651,14 +3714,28 @@ app.post("/api/auth/forgot-password/send-otp", async (req, res) => {
       FORGOT_PASSWORD_OTP_TTL_SEC
     );
 
-    const sendResult = await sendWhatsAppOtpMessage(phone, otp);
-
-    if (sendResult.deliveryFailed) {
-      return res.status(502).json({
-        success: false,
-        message: `WhatsApp OTP delivery failed (${sendResult.error || "Meta WhatsApp service error"}). Please check WhatsApp service credentials.`,
-      });
+    // 1. If KwikEngage / GoKwik is configured, send via KwikEngage WhatsApp
+    let otpSent = false;
+    if (gokwikService.isConfigured()) {
+      const gokwikRes = await gokwikService.sendOtp(phone, otp);
+      if (gokwikRes.success) {
+        otpSent = true;
+      } else {
+        console.warn("[Forgot Password] KwikEngage send failed, falling back to direct Meta API...", gokwikRes.error);
+      }
     }
+
+    // 2. Direct Meta WhatsApp API Fallback
+    if (!otpSent) {
+      const sendResult = await sendWhatsAppOtpMessage(phone, otp);
+      if (sendResult.deliveryFailed) {
+        return res.status(502).json({
+          success: false,
+          message: `WhatsApp OTP delivery failed (${sendResult.error || "WhatsApp service error"}). Please check service credentials.`,
+        });
+      }
+    }
+
 
     const maskedPhone = phone.length >= 10
       ? `${phone.slice(0, phone.length - 4).replace(/./g, "*")}${phone.slice(-4)}`
