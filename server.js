@@ -3545,41 +3545,6 @@ app.post("/api/auth/whatsapp/verify-otp", async (req, res) => {
     }
 
     const entry = cache.get(otpCacheKey(phone));
-    
-    // 1. If GoKwik was used or configured
-    if (entry?.provider === "gokwik" || gokwikService.isConfigured()) {
-      const gokwikVerify = await gokwikService.verifyOtp(phone, otp, entry?.requestId);
-      if (gokwikVerify.success && gokwikVerify.verified) {
-        cache.del(otpCacheKey(phone));
-
-        if (verifyOnly) {
-          return res.json({
-            success: true,
-            phone,
-            verified: true,
-            provider: "gokwik",
-          });
-        }
-
-        const token = await getOrCreateOtpCustomerToken({ phone, firstName, lastName });
-        return res.json({
-          success: true,
-          customer: {
-            accessToken: token.accessToken,
-            expiresAt: token.expiresAt,
-            phone,
-            authProvider: "whatsapp_gokwik",
-          },
-        });
-      } else if (!entry?.hash) {
-        return res.status(400).json({
-          success: false,
-          message: gokwikVerify.error || "Incorrect or expired OTP",
-        });
-      }
-    }
-
-    // 2. Direct Meta WhatsApp OTP verification
     if (!entry) {
       return res.status(400).json({ success: false, message: "OTP expired. Please request a new OTP." });
     }
