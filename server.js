@@ -406,6 +406,219 @@ async function computeAny3BundleDiscount(cart) {
   return { discount, bundles, eligibleQty };
 }
 
+/* ------------------ AUTOMATIC PROMOTIONS & FREE GIFTS ENGINE ------------------ */
+
+const HNK_TOOL_VARIANT_IDS = new Set([
+  "49634701115696", "49634736374064", "49634794635568", "49634910142768",
+  "49634923020592", "49634924134704", "49634925510960", "49634929639728",
+  "49634929672496", "49635038331184", "49635038363952", "49635038396720",
+  "49635038429488", "49635038462256", "49635061924144", "49635101901104",
+  "49635127460144", "49635127492912", "49635140600112", "49635156132144",
+  "49635159769392", "49635163799856", "49635172843824", "49635172876592",
+  "49635172909360", "49635172942128", "49635187818800", "49635191521584",
+  "49635191554352", "49635193749808", "49635291070768", "50461786439984",
+  "50461799776560", "50461805904176", "66739417088304", "66739523420464",
+  "66739534201136", "67570488639792"
+]);
+
+const HNK_PADDLE_BRUSH_VARIANT_ID = "49634937995568";
+
+const BB_CREAM_VARIANT_IDS = new Set([
+  "67720111882544", "67720111915312", "67720111948080",
+  "67720111980848", "67720112013616", "67720112046384"
+]);
+
+const KAJAL_VARIANT_IDS = new Set([
+  "67720339423536", "67720339456304"
+]);
+
+function buildShopifyLineItemsWithPromotions(cart) {
+  if (!Array.isArray(cart) || cart.length === 0) {
+    return { line_items: [], promotionalDiscount: 0, appliedPromotions: [] };
+  }
+
+  let promotionalDiscount = 0;
+  const appliedPromotions = [];
+  const finalLineItems = [];
+
+  const items = cart.map(item => ({
+    ...item,
+    numericVariantId: String(toNumericId(item.variant_id || item.variantId) || ""),
+    qty: Math.max(1, Number(item.quantity || item.qty || 1)),
+    unitPrice: Number(item.price || 0)
+  }));
+
+  const handledB1G2Indices = new Set();
+
+  function processB1G2(variantSet, promoTitle, defaultPrice) {
+    const matched = [];
+    for (let i = 0; i < items.length; i++) {
+      if (variantSet.has(items[i].numericVariantId)) {
+        matched.push({ index: i, item: items[i] });
+      }
+    }
+    if (matched.length === 0) return;
+
+    matched.forEach(m => handledB1G2Indices.add(m.index));
+
+    const totalQty = matched.reduce((sum, m) => sum + m.item.qty, 0);
+    const unitPrice = matched[0].item.unitPrice || defaultPrice;
+
+    const units = [];
+    for (const m of matched) {
+      for (let q = 0; q < m.item.qty; q++) {
+        units.push({
+          variant_id: m.item.numericVariantId,
+          title: m.item.title || promoTitle,
+          price: unitPrice
+        });
+      }
+    }
+
+    const completedBundles = Math.floor(totalQty / 3);
+    const remainder = totalQty % 3;
+
+    let freeUnitsCount = completedBundles * 2;
+    if (remainder === 2) {
+      freeUnitsCount += 1;
+    }
+
+    let promoDiscForCategory = 0;
+    const paidUnitsCount = totalQty - freeUnitsCount;
+
+    for (let u = 0; u < units.length; u++) {
+      const isFree = u >= paidUnitsCount;
+      if (isFree) {
+        promoDiscForCategory += unitPrice;
+        finalLineItems.push({
+          variant_id: units[u].variant_id,
+          quantity: 1,
+          price: "0.00",
+          properties: [
+            { name: "_is_free_gift", value: "true" },
+            { name: "Promotion", value: `${promoTitle} (Free Item)` }
+          ]
+        });
+      } else {
+        finalLineItems.push({
+          variant_id: units[u].variant_id,
+          quantity: 1,
+          price: unitPrice.toFixed(2)
+        });
+      }
+    }
+
+    if (remainder === 1) {
+      const lastVariantId = units[units.length - 1].variant_id;
+      finalLineItems.push({
+        variant_id: lastVariantId,
+        quantity: 2,
+        price: "0.00",
+        properties: [
+          { name: "_is_free_gift", value: "true" },
+          { name: "Promotion", value: `${promoTitle} (Auto-added 2 Free Items)` }
+        ]
+      });
+    } else if (remainder === 2) {
+      const lastVariantId = units[units.length - 1].variant_id;
+      finalLineItems.push({
+        variant_id: lastVariantId,
+        quantity: 1,
+        price: "0.00",
+        properties: [
+          { name: "_is_free_gift", value: "true" },
+          { name: "Promotion", value: `${promoTitle} (Auto-added 1 Free Item)` }
+        ]
+      });
+    }
+
+    promotionalDiscount += promoDiscForCategory;
+    appliedPromotions.push({
+      title: promoTitle,
+      discount: promoDiscForCategory,
+      totalQty,
+      entitledTotal: completedBundles * 3 + (remainder > 0 ? 3 : 0)
+    });
+  }
+
+  processB1G2(BB_CREAM_VARIANT_IDS, "Gorgeous Girl BB Cream - Buy 1 Get 2 Free", 1099.00);
+  processB1G2(KAJAL_VARIANT_IDS, "Gorgeous Girl Kajal - Buy 1 Get 2 Free", 299.00);
+
+  for (let i = 0; i < items.length; i++) {
+    if (handledB1G2Indices.has(i)) continue;
+    const it = items[i];
+
+    const hasHnkToolInCart = items.some(x => HNK_TOOL_VARIANT_IDS.has(x.numericVariantId));
+    if (it.numericVariantId === HNK_PADDLE_BRUSH_VARIANT_ID && hasHnkToolInCart) {
+      if (it.qty > 1) {
+        finalLineItems.push({
+          variant_id: it.numericVariantId,
+          quantity: it.qty - 1,
+          price: it.unitPrice.toFixed(2)
+        });
+      }
+      finalLineItems.push({
+        variant_id: it.numericVariantId,
+        quantity: 1,
+        price: "0.00",
+        properties: [
+          { name: "_is_free_gift", value: "true" },
+          { name: "Promotion", value: "Free HNK Paddle Brush with Hair Tool" }
+        ]
+      });
+      promotionalDiscount += it.unitPrice || 422.50;
+      appliedPromotions.push({
+        title: "HNK Hair Tools - Free Paddle Hair Brush",
+        discount: it.unitPrice || 422.50
+      });
+    } else {
+      finalLineItems.push({
+        variant_id: it.numericVariantId,
+        quantity: it.qty,
+        price: it.unitPrice > 0 ? it.unitPrice.toFixed(2) : undefined
+      });
+    }
+  }
+
+  const hasHnkTool = items.some(x => HNK_TOOL_VARIANT_IDS.has(x.numericVariantId));
+  const hasPaddleBrush = items.some(x => x.numericVariantId === HNK_PADDLE_BRUSH_VARIANT_ID);
+  if (hasHnkTool && !hasPaddleBrush) {
+    finalLineItems.push({
+      variant_id: HNK_PADDLE_BRUSH_VARIANT_ID,
+      quantity: 1,
+      price: "0.00",
+      properties: [
+        { name: "_is_free_gift", value: "true" },
+        { name: "Promotion", value: "Free HNK Paddle Brush with Hair Tool" }
+      ]
+    });
+    appliedPromotions.push({
+      title: "HNK Hair Tools - Free Paddle Hair Brush",
+      discount: 422.50
+    });
+  }
+
+  const compacted = [];
+  for (const li of finalLineItems) {
+    const existing = compacted.find(c =>
+      String(c.variant_id) === String(li.variant_id) &&
+      c.price === li.price &&
+      JSON.stringify(c.properties) === JSON.stringify(li.properties)
+    );
+    if (existing) {
+      existing.quantity += li.quantity;
+    } else {
+      compacted.push({ ...li });
+    }
+  }
+
+  return {
+    line_items: compacted,
+    promotionalDiscount,
+    appliedPromotions
+  };
+}
+
 async function getShopifyCustomerId(email, phone) {
   try {
     if (email && String(email).trim()) {
@@ -2346,6 +2559,7 @@ const OrderSchema = new mongoose.Schema({
   shippingAmount: Number,
   totalMrp: Number,
   productDiscount: Number,
+  promotionalDiscount: Number,
   shopify_order_id: String,
   shopify_order_number: String,
   shopify_order_data: Object,
@@ -3872,6 +4086,24 @@ app.get("/api/payment/config", (req, res) => {
   });
 });
 
+/* ------------------ CART PROMOTIONS ENDPOINT ------------------ */
+
+app.post("/api/cart/calculate-promotions", (req, res) => {
+  try {
+    const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
+    const result = buildShopifyLineItemsWithPromotions(cart);
+    res.json({
+      success: true,
+      promotionalDiscount: result.promotionalDiscount,
+      appliedPromotions: result.appliedPromotions,
+      line_items: result.line_items,
+    });
+  } catch (err) {
+    console.error("[Promotions Engine Error]:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.post("/api/payment/create-order", async (req, res) => {
   try {
     const {
@@ -3889,6 +4121,7 @@ app.post("/api/payment/create-order", async (req, res) => {
       shippingAmount,
       totalMrp,
       productDiscount,
+      promotionalDiscount,
     } = req.body;
 
     const keyId = String(process.env.RAZORPAY_KEY_ID || "").trim();
@@ -3896,6 +4129,13 @@ app.post("/api/payment/create-order", async (req, res) => {
     if (!keyId || !process.env.RAZORPAY_KEY_SECRET) {
       return res.status(500).json({ error: "Payment config missing" });
     }
+
+    // Evaluate automatic promotions on cart
+    const autoOffers = buildShopifyLineItemsWithPromotions(cart);
+    const calculatedPromoDisc = Math.max(0, Number(autoOffers.promotionalDiscount || 0));
+    const effectivePromoDisc = Number.isFinite(Number(promotionalDiscount)) && Number(promotionalDiscount) > 0
+      ? Number(promotionalDiscount)
+      : calculatedPromoDisc;
 
     const receiptId = "order_" + Date.now();
     const cleanEmail = String(email || "").trim();
@@ -3937,8 +4177,9 @@ app.post("/api/payment/create-order", async (req, res) => {
         shippingAmount: Number(shippingAmount || 0),
         totalMrp: totalMrp !== undefined ? Number(totalMrp) : null,
         productDiscount: productDiscount !== undefined ? Number(productDiscount) : null,
+        promotionalDiscount: effectivePromoDisc,
       });
-      console.log(`[Order Persistence] Saved initial order record in MongoDB for Razorpay Order ${order.id}`);
+      console.log(`[Order Persistence] Saved initial order record in MongoDB for Razorpay Order ${order.id} (Promotional discount: ₹${effectivePromoDisc})`);
     } catch (dbErr) {
       console.error("[Order Persistence Error]:", dbErr.message);
     }
@@ -4027,9 +4268,12 @@ async function processAndCreateShopifyOrder({
   const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
   const couponDisc = Math.max(0, Number(couponDiscount || 0));
 
+  const autoOffers = buildShopifyLineItemsWithPromotions(cart);
+  const promoDisc = Math.max(0, Number(autoOffers.promotionalDiscount || 0));
+
   const calculatedOrderTotal = Math.max(
     0,
-    cartSubtotal + Number(finalShipping.price) - couponDisc - bundleDisc
+    cartSubtotal + Number(finalShipping.price) - couponDisc - bundleDisc - promoDisc
   );
   const paidAmount = Number(razorpayOrder?.amount_paid || razorpayOrder?.amount || customerData.amount || 0) / 100;
   const orderTotal = Number.isFinite(paidAmount) && paidAmount > 0
@@ -4048,6 +4292,13 @@ async function processAndCreateShopifyOrder({
     discountCodesPayload.push({
       code: "AUTO_BUNDLE_ANY3_1500",
       amount: bundleDisc.toFixed(2),
+      type: "fixed_amount",
+    });
+  }
+  if (promoDisc > 0) {
+    discountCodesPayload.push({
+      code: "AUTO_PROMO_OFFER",
+      amount: promoDisc.toFixed(2),
       type: "fixed_amount",
     });
   }
@@ -4093,9 +4344,11 @@ async function processAndCreateShopifyOrder({
   // 6. Build Order Payload
   const orderPayload = {
     order: {
-      line_items: cart.map(item => ({
+      line_items: autoOffers.line_items.map(item => ({
         variant_id: toNumericId(item.variant_id),
         quantity: item.quantity,
+        ...(item.price !== undefined ? { price: item.price } : {}),
+        ...(Array.isArray(item.properties) && item.properties.length > 0 ? { properties: item.properties } : {}),
       })),
       financial_status: "paid",
       customer: shopifyCustomerId
@@ -4146,9 +4399,9 @@ async function processAndCreateShopifyOrder({
           gateway: "Razorpay",
         },
       ],
-      tags: "razorpay,mobile_app",
+      tags: `razorpay,mobile_app${autoOffers.appliedPromotions.length > 0 ? ',free_gift,promotional_offer' : ''}`,
       gateway: "Razorpay",
-      note: `Razorpay Payment ID: ${razorpay_payment_id || ""} | Order ID: ${razorpay_order_id}`,
+      note: `Razorpay Payment ID: ${razorpay_payment_id || ""} | Order ID: ${razorpay_order_id}${autoOffers.appliedPromotions.length > 0 ? ' | Promos: ' + autoOffers.appliedPromotions.map(p => p.title).join(", ") : ""}`,
       note_attributes: [
         { name: "Payment ID", value: String(razorpay_payment_id || "") },
         { name: "Order ID", value: String(razorpay_order_id) },
