@@ -486,11 +486,7 @@ function buildShopifyLineItemsWithPromotions(cart) {
     const completedBundles = Math.floor(totalQty / 3);
     const remainder = totalQty % 3;
 
-    let freeUnitsCount = completedBundles * 2;
-    if (remainder === 2) {
-      freeUnitsCount += 1;
-    }
-
+    const freeUnitsCount = completedBundles * 2;
     let promoDiscForCategory = 0;
 
     for (let u = 0; u < units.length; u++) {
@@ -530,11 +526,11 @@ function buildShopifyLineItemsWithPromotions(cart) {
       const lastVariantId = units[units.length - 1].variant_id;
       finalLineItems.push({
         variant_id: lastVariantId,
-        quantity: 1,
+        quantity: 4,
         price: "0.00",
         properties: [
           { name: "_is_free_gift", value: "true" },
-          { name: "Promotion", value: `${promoTitle} (Auto-added 1 Free Item)` }
+          { name: "Promotion", value: `${promoTitle} (Auto-added 4 Free Items)` }
         ]
       });
     }
