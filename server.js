@@ -429,7 +429,12 @@ const BB_CREAM_VARIANT_IDS = new Set([
 ]);
 
 const KAJAL_VARIANT_IDS = new Set([
-  "67720339423536", "67720339456304"
+  // Gorgeous Girl Automatic Kajal Pencil with One Stroke Smooth Glide (₹299)
+  "67720339423536", "67720339456304",
+  // Gorgeous Girl Kohl kajal with One Stroke Smooth Glide (₹499)
+  "67744379076912",
+  // Gorgeous Girl Pro 1 Stroke Stay-On Kohl Pencil – Waterproof Long Lasting Kajal (₹449)
+  "67745185628464", "67745185661232", "67745185694000", "67745185726768", "67745185759536"
 ]);
 
 function buildShopifyLineItemsWithPromotions(cart) {
@@ -462,18 +467,21 @@ function buildShopifyLineItemsWithPromotions(cart) {
     matched.forEach(m => handledB1G2Indices.add(m.index));
 
     const totalQty = matched.reduce((sum, m) => sum + m.item.qty, 0);
-    const unitPrice = matched[0].item.unitPrice || defaultPrice;
 
     const units = [];
     for (const m of matched) {
+      const uPrice = (m.item.unitPrice && m.item.unitPrice > 0) ? m.item.unitPrice : defaultPrice;
       for (let q = 0; q < m.item.qty; q++) {
         units.push({
           variant_id: m.item.numericVariantId,
           title: m.item.title || promoTitle,
-          price: unitPrice
+          price: uPrice
         });
       }
     }
+
+    // Sort cheapest units first so free items take lowest price (consistent with Shopify BxGY)
+    units.sort((a, b) => a.price - b.price);
 
     const completedBundles = Math.floor(totalQty / 3);
     const remainder = totalQty % 3;
@@ -484,12 +492,11 @@ function buildShopifyLineItemsWithPromotions(cart) {
     }
 
     let promoDiscForCategory = 0;
-    const paidUnitsCount = totalQty - freeUnitsCount;
 
     for (let u = 0; u < units.length; u++) {
-      const isFree = u >= paidUnitsCount;
+      const isFree = u < freeUnitsCount;
       if (isFree) {
-        promoDiscForCategory += unitPrice;
+        promoDiscForCategory += units[u].price;
         finalLineItems.push({
           variant_id: units[u].variant_id,
           quantity: 1,
@@ -503,7 +510,7 @@ function buildShopifyLineItemsWithPromotions(cart) {
         finalLineItems.push({
           variant_id: units[u].variant_id,
           quantity: 1,
-          price: unitPrice.toFixed(2)
+          price: units[u].price.toFixed(2)
         });
       }
     }
