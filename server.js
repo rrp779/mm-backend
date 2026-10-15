@@ -1079,7 +1079,7 @@ function calculateShipping(cartSubtotal, isCod = false) {
   }
   return isCod
     ? { title: "COD Shipping",      price: "120.00", code: "COD" }
-    : { title: "Standard Shipping", price: "80.00",  code: "FLAT" };
+    : { title: "Standard Shipping", price: "99.00",  code: "FLAT" };
 }
 
 function getShippingForCart(cart, cartSubtotal) {
@@ -1110,7 +1110,7 @@ function getShippingForCart(cart, cartSubtotal) {
   }
   
   if (hasRegularProduct) {
-    shipping += 80;
+    shipping += 99;
   }
   
   return {
