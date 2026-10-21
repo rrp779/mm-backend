@@ -68,9 +68,15 @@ function normalizeIndianPhone(raw) {
   let phone = String(raw || "").replace(/[^\d+]/g, "").trim();
   if (!phone) return "";
   if (phone.startsWith("+")) {
-    phone = `+${phone.slice(1).replace(/\D/g, "")}`;
+    let digits = phone.slice(1).replace(/\D/g, "");
+    if (digits.startsWith("0")) digits = digits.replace(/^0+/, "");
+    if (digits.length === 10) return `+91${digits}`;
+    return `+${digits}`;
   } else {
     phone = phone.replace(/\D/g, "");
+    if (phone.length === 11 && phone.startsWith("0")) {
+      phone = phone.slice(1);
+    }
     if (phone.length === 10) phone = `+91${phone}`;
     else if (phone.startsWith("91") && phone.length === 12) phone = `+${phone}`;
     else phone = `+${phone}`;
@@ -209,13 +215,20 @@ function normalizePhoneE164(phone, defaultCountry = "IN") {
   if (cleaned.startsWith("00")) cleaned = `+${cleaned.slice(2)}`;
 
   if (cleaned.startsWith("+")) {
-    const digits = cleaned.slice(1).replace(/\D/g, "");
+    let digits = cleaned.slice(1).replace(/\D/g, "");
+    if (defaultCountry === "IN" && digits.startsWith("0")) {
+      digits = digits.replace(/^0+/, "");
+      if (digits.length === 10) return `+91${digits}`;
+    }
     if (digits.length < 10 || digits.length > 15) return null;
     return `+${digits}`;
   }
 
-  const digits = cleaned.replace(/\D/g, "");
+  let digits = cleaned.replace(/\D/g, "");
   if (defaultCountry === "IN") {
+    if (digits.length === 11 && digits.startsWith("0")) {
+      digits = digits.slice(1);
+    }
     if (digits.length === 10) return `+91${digits}`;
     if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
   }
@@ -4448,17 +4461,42 @@ async function processAndCreateShopifyOrder({
   };
 
   // 7. Create Order in Shopify
-  const shopifyOrderResponse = await axios.post(
-    `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
-    orderPayload,
-    {
-      headers: {
-        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-      },
-    }
-  );
+  let createdOrder;
+  try {
+    const shopifyOrderResponse = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
+      orderPayload,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    createdOrder = shopifyOrderResponse.data.order;
+  } catch (firstErr) {
+    const errStr = JSON.stringify(firstErr?.response?.data || "").toLowerCase();
+    if (errStr.includes("phone")) {
+      console.warn("[Order Engine] Shopify order rejected due to invalid phone. Stripping phone and retrying creation so payment is never lost...");
+      const fallbackPayload = JSON.parse(JSON.stringify(orderPayload));
+      delete fallbackPayload.order.phone;
+      if (fallbackPayload.order.customer) delete fallbackPayload.order.customer.phone;
+      if (fallbackPayload.order.billing_address) delete fallbackPayload.order.billing_address.phone;
+      if (fallbackPayload.order.shipping_address) delete fallbackPayload.order.shipping_address.phone;
 
-  const createdOrder = shopifyOrderResponse.data.order;
+      const retryRes = await axios.post(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders.json`,
+        fallbackPayload,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+      createdOrder = retryRes.data.order;
+    } else {
+      throw firstErr;
+    }
+  }
 
   // 8. Update MongoDB Record
   try {
