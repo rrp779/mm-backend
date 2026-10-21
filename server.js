@@ -4709,6 +4709,13 @@ app.post("/api/payment/failed", async (req, res) => {
 
 /* ------------------ RAZORPAY WEBHOOK ------------------ */
 
+app.get("/api/payment/webhook", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Razorpay webhook endpoint is live and listening for POST requests.",
+  });
+});
+
 app.post("/api/payment/webhook", async (req, res) => {
   try {
     const signature = req.headers["x-razorpay-signature"];
