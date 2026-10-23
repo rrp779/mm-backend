@@ -4213,6 +4213,53 @@ app.post("/api/payment/create-order", async (req, res) => {
 
 /* ------------------ PROCESS & CREATE SHOPIFY ORDER ENGINE ------------------ */
 
+async function markShopifyOrderAsPaid(numericOrderId) {
+  const query = `
+    mutation orderMarkAsPaid($input: OrderMarkAsPaidInput!) {
+      orderMarkAsPaid(input: $input) {
+        order {
+          id
+          displayFinancialStatus
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+  try {
+    const res = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/graphql.json`,
+      {
+        query,
+        variables: {
+          input: {
+            id: `gid://shopify/Order/${numericOrderId}`,
+          },
+        },
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        },
+      }
+    );
+    const result = res.data?.data?.orderMarkAsPaid;
+    if (result?.order?.displayFinancialStatus === "PAID") {
+      console.log(`[Order Engine] Successfully marked order ${numericOrderId} as fully PAID via GraphQL`);
+      return true;
+    }
+    if (result?.userErrors?.length) {
+      console.warn(`[Order Engine] GraphQL user errors marking order ${numericOrderId} as paid:`, result.userErrors);
+    }
+  } catch (err) {
+    console.warn(`[Order Engine] Failed to mark order ${numericOrderId} as paid:`, err.message);
+  }
+  return false;
+}
+
 async function processAndCreateShopifyOrder({
   razorpay_order_id,
   razorpay_payment_id,
@@ -4280,6 +4327,17 @@ async function processAndCreateShopifyOrder({
   }, 0);
   const finalShipping = getShippingForCart(cart, cartSubtotal);
 
+  // Respect shipping actually charged to customer if provided (e.g. older app versions with legacy shipping rate)
+  const shippingCharged = (customerData.shippingAmount !== undefined && customerData.shippingAmount !== null)
+    ? Number(customerData.shippingAmount)
+    : (dbOrder?.shippingAmount !== undefined && dbOrder?.shippingAmount !== null
+        ? Number(dbOrder.shippingAmount)
+        : Number(finalShipping.price));
+
+  const effectiveShippingPrice = Number.isFinite(shippingCharged) ? shippingCharged.toFixed(2) : finalShipping.price;
+  const effectiveShippingTitle = Number(effectiveShippingPrice) === 0 ? "Free Shipping" : finalShipping.title;
+  const effectiveShippingCode = Number(effectiveShippingPrice) === 0 ? "FREE" : finalShipping.code;
+
   const bundleInfo = await computeAny3BundleDiscount(cart);
   const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
   const couponDisc = Math.max(0, Number(couponDiscount || 0));
@@ -4289,7 +4347,7 @@ async function processAndCreateShopifyOrder({
 
   const calculatedOrderTotal = Math.max(
     0,
-    cartSubtotal + Number(finalShipping.price) - couponDisc - bundleDisc - promoDisc
+    cartSubtotal + Number(effectiveShippingPrice) - couponDisc - bundleDisc - promoDisc
   );
   const paidAmount = Number(razorpayOrder?.amount_paid || razorpayOrder?.amount || customerData.amount || 0) / 100;
   const orderTotal = Number.isFinite(paidAmount) && paidAmount > 0
@@ -4401,9 +4459,9 @@ async function processAndCreateShopifyOrder({
       },
       shipping_lines: [
         {
-          title: finalShipping.title,
-          price: finalShipping.price,
-          code: finalShipping.code,
+          title: effectiveShippingTitle,
+          price: effectiveShippingPrice,
+          code: effectiveShippingCode,
         },
       ],
       discount_codes: discountCodesPayload,
@@ -4411,7 +4469,7 @@ async function processAndCreateShopifyOrder({
         {
           kind: "sale",
           status: "success",
-          amount: orderTotal.toFixed(2),
+          amount: Math.max(orderTotal, calculatedOrderTotal).toFixed(2),
           gateway: "Razorpay",
         },
       ],
@@ -4495,6 +4553,16 @@ async function processAndCreateShopifyOrder({
       createdOrder = retryRes.data.order;
     } else {
       throw firstErr;
+    }
+  }
+
+  // 7b. Guarantee financial_status is fully PAID (auto-heal any legacy app shipping or decimal/rounding differences)
+  if (createdOrder && (createdOrder.financial_status === "partially_paid" || Number(createdOrder.total_outstanding || 0) > 0)) {
+    console.warn(`[Order Engine] Order ${createdOrder.name} created as partially_paid (Outstanding: ₹${createdOrder.total_outstanding}). Reconciling to PAID via GraphQL...`);
+    const marked = await markShopifyOrderAsPaid(createdOrder.id);
+    if (marked) {
+      createdOrder.financial_status = "paid";
+      createdOrder.total_outstanding = "0.00";
     }
   }
 
