@@ -4888,6 +4888,56 @@ async function preflightMongoSrvLookup(mongoUri) {
   }
 }
 
+/* ------------------ AUTOMATED PAYMENT RECONCILER (SAFETY NET) ------------------ */
+
+let isReconciling = false;
+async function reconcilePendingCapturedPayments() {
+  if (isReconciling) return;
+  isReconciling = true;
+  try {
+    // Look back at orders created in the last 24 hours that remain in 'created' status
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const pendingOrders = await Order.find({
+      status: "created",
+      created_at: { $gte: oneDayAgo },
+      razorpay_order_id: { $exists: true, $ne: null },
+    }).limit(15);
+
+    if (!pendingOrders || pendingOrders.length === 0) {
+      isReconciling = false;
+      return;
+    }
+
+    for (const pending of pendingOrders) {
+      try {
+        const payments = await razorpay.orders.fetchPayments(pending.razorpay_order_id);
+        const captured = (payments.items || []).find((p) => p.status === "captured" && p.captured);
+
+        if (captured) {
+          console.log(
+            `[Auto-Reconciler] Found captured payment ${captured.id} for pending order ${pending.razorpay_order_id}. Auto-creating Shopify order...`
+          );
+          await processAndCreateShopifyOrder({
+            razorpay_order_id: pending.razorpay_order_id,
+            razorpay_payment_id: captured.id,
+            customerData: {
+              email: captured.email || pending.email,
+              phone: captured.contact || pending.phone,
+              amount: captured.amount / 100,
+            },
+          });
+        }
+      } catch (checkErr) {
+        // Individual order check failure, continue with other pending orders
+      }
+    }
+  } catch (err) {
+    console.error("[Auto-Reconciler Error]:", err.message);
+  } finally {
+    isReconciling = false;
+  }
+}
+
 async function startServer() {
   try {
     
@@ -4917,6 +4967,9 @@ async function startServer() {
 
     const server = app.listen(PORT, () => {
       console.log(`Server running on port ${PORT} 🚀`);
+      // Start automated background payment auto-reconciler (safety net)
+      setInterval(reconcilePendingCapturedPayments, 3 * 60 * 1000);
+      setTimeout(reconcilePendingCapturedPayments, 15 * 1000);
     });
 
     server.on("error", (err) => {
