@@ -4134,11 +4134,22 @@ app.post("/api/payment/create-order", async (req, res) => {
       shipping_address,
       couponCode,
       couponDiscount,
+      coupon_discount,
       shippingAmount,
+      shipping,
       totalMrp,
+      total_mrp,
       productDiscount,
+      discount,
       promotionalDiscount,
+      promotional_discount,
     } = req.body;
+
+    const effectiveShippingAmount = shippingAmount !== undefined ? shippingAmount : shipping;
+    const effectiveCouponDiscount = couponDiscount !== undefined ? couponDiscount : coupon_discount;
+    const effectiveTotalMrp = totalMrp !== undefined ? totalMrp : total_mrp;
+    const effectiveProductDiscount = productDiscount !== undefined ? productDiscount : discount;
+    const rawPromoDisc = promotionalDiscount !== undefined ? promotionalDiscount : promotional_discount;
 
     const keyId = String(process.env.RAZORPAY_KEY_ID || "").trim();
 
@@ -4149,8 +4160,8 @@ app.post("/api/payment/create-order", async (req, res) => {
     // Evaluate automatic promotions on cart
     const autoOffers = buildShopifyLineItemsWithPromotions(cart);
     const calculatedPromoDisc = Math.max(0, Number(autoOffers.promotionalDiscount || 0));
-    const effectivePromoDisc = Number.isFinite(Number(promotionalDiscount)) && Number(promotionalDiscount) > 0
-      ? Number(promotionalDiscount)
+    const effectivePromoDisc = Number.isFinite(Number(rawPromoDisc)) && Number(rawPromoDisc) > 0
+      ? Number(rawPromoDisc)
       : calculatedPromoDisc;
 
     const receiptId = "order_" + Date.now();
@@ -4189,13 +4200,15 @@ app.post("/api/payment/create-order", async (req, res) => {
         shipping_address: selectedShipAddr,
         billing_address: selectedBillAddr,
         couponCode: couponCode || null,
-        couponDiscount: Number(couponDiscount || 0),
-        shippingAmount: Number(shippingAmount || 0),
-        totalMrp: totalMrp !== undefined ? Number(totalMrp) : null,
-        productDiscount: productDiscount !== undefined ? Number(productDiscount) : null,
+        couponDiscount: Number(effectiveCouponDiscount || 0),
+        shippingAmount: (effectiveShippingAmount !== undefined && effectiveShippingAmount !== null && !isNaN(Number(effectiveShippingAmount)))
+          ? Number(effectiveShippingAmount)
+          : null,
+        totalMrp: effectiveTotalMrp !== undefined ? Number(effectiveTotalMrp) : null,
+        productDiscount: effectiveProductDiscount !== undefined ? Number(effectiveProductDiscount) : null,
         promotionalDiscount: effectivePromoDisc,
       });
-      console.log(`[Order Persistence] Saved initial order record in MongoDB for Razorpay Order ${order.id} (Promotional discount: ₹${effectivePromoDisc})`);
+      console.log(`[Order Persistence] Saved initial order record in MongoDB for Razorpay Order ${order.id} (Shipping: ₹${effectiveShippingAmount ?? 'calculated'}, Promotional discount: ₹${effectivePromoDisc})`);
     } catch (dbErr) {
       console.error("[Order Persistence Error]:", dbErr.message);
     }
@@ -4276,6 +4289,59 @@ async function processAndCreateShopifyOrder({
   // If already created in Shopify, return existing order (Idempotent)
   if (dbOrder && dbOrder.status === "shopify_created" && dbOrder.shopify_order_id) {
     console.log(`[Order Engine] Order ${razorpay_order_id} already created in Shopify (ID: ${dbOrder.shopify_order_id})`);
+
+    // Backfill address if Shopify order or dbOrder was created without an address
+    const incomingAddress1 = customerData.address1 || customerData.shipping_address?.address1;
+    const existingHasAddress = !!(dbOrder.shipping_address?.address1 || dbOrder.shopify_order_data?.shipping_address?.address1);
+
+    if (incomingAddress1 && !existingHasAddress) {
+      try {
+        console.log(`[Order Engine] Existing Shopify order ${dbOrder.shopify_order_id} was missing shipping address. Backfilling now...`);
+        const updateAddr = {
+          first_name: customerData.first_name || dbOrder.first_name || "",
+          last_name: customerData.last_name || dbOrder.last_name || "",
+          address1: incomingAddress1,
+          address2: customerData.address2 || "",
+          city: customerData.city || "",
+          province: customerData.province || customerData.state || "",
+          country: customerData.country || "India",
+          zip: customerData.pincode || customerData.zip || "",
+          phone: customerData.phone || dbOrder.phone || "",
+        };
+        await axios.put(
+          `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders/${dbOrder.shopify_order_id}.json`,
+          {
+            order: {
+              id: Number(dbOrder.shopify_order_id),
+              shipping_address: updateAddr,
+              billing_address: updateAddr,
+              ...(customerData.first_name ? {
+                customer: {
+                  first_name: customerData.first_name,
+                  last_name: customerData.last_name || "",
+                }
+              } : {})
+            },
+          },
+          {
+            headers: {
+              "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+            },
+          }
+        );
+        dbOrder.shipping_address = updateAddr;
+        dbOrder.billing_address = updateAddr;
+        if (customerData.first_name && (!dbOrder.first_name || dbOrder.first_name === "Customer")) {
+          dbOrder.first_name = customerData.first_name;
+          dbOrder.last_name = customerData.last_name || "";
+        }
+        await dbOrder.save();
+        console.log(`[Order Engine] Successfully backfilled address on existing Shopify order ${dbOrder.shopify_order_id}`);
+      } catch (updErr) {
+        console.error("[Order Engine] Failed to backfill address on existing order:", updErr.message);
+      }
+    }
+
     return {
       success: true,
       order: dbOrder.shopify_order_data || { id: dbOrder.shopify_order_id, name: dbOrder.shopify_order_number },
@@ -4305,16 +4371,49 @@ async function processAndCreateShopifyOrder({
   }
 
   // Merge customer and address info
-  const first_name = customerData.first_name || dbOrder?.first_name || "";
-  const last_name = customerData.last_name || dbOrder?.last_name || "";
-  const email = customerData.email || dbOrder?.email || razorpayOrder?.notes?.email || "";
-  const phone = customerData.phone || dbOrder?.phone || razorpayOrder?.notes?.phone || "";
-  const address1 = customerData.address1 || dbOrder?.shipping_address?.address1 || "";
-  const address2 = customerData.address2 || dbOrder?.shipping_address?.address2 || "";
-  const city = customerData.city || dbOrder?.shipping_address?.city || "";
-  const province = customerData.province || customerData.state || dbOrder?.shipping_address?.province || "";
-  const country = customerData.country || dbOrder?.shipping_address?.country || "India";
-  const pincode = customerData.pincode || customerData.zip || dbOrder?.shipping_address?.zip || "";
+  let first_name = customerData.first_name || dbOrder?.first_name || "";
+  let last_name = customerData.last_name || dbOrder?.last_name || "";
+  let email = customerData.email || dbOrder?.email || razorpayOrder?.notes?.email || "";
+  let phone = customerData.phone || dbOrder?.phone || razorpayOrder?.notes?.phone || "";
+  let address1 = customerData.address1 || dbOrder?.shipping_address?.address1 || "";
+  let address2 = customerData.address2 || dbOrder?.shipping_address?.address2 || "";
+  let city = customerData.city || dbOrder?.shipping_address?.city || "";
+  let province = customerData.province || customerData.state || dbOrder?.shipping_address?.province || "";
+  let country = customerData.country || dbOrder?.shipping_address?.country || "India";
+  let pincode = customerData.pincode || customerData.zip || dbOrder?.shipping_address?.zip || "";
+
+  // Lookup Customer ID early to enable default address fallback if needed
+  const shopifyCustomerId = await getShopifyCustomerId(email, phone);
+  const normalizedPhone = normalizePhoneE164(phone, "IN");
+
+  // Fallback: If address1 is missing, fetch customer's default address from Shopify Customer profile
+  if (!address1 && shopifyCustomerId) {
+    try {
+      const custResp = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/${shopifyCustomerId}.json`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          },
+        }
+      );
+      const cust = custResp.data?.customer;
+      const defAddr = cust?.default_address;
+      if (defAddr && defAddr.address1) {
+        address1 = defAddr.address1 || "";
+        address2 = defAddr.address2 || "";
+        city = defAddr.city || "";
+        province = defAddr.province || "";
+        country = defAddr.country || "India";
+        pincode = defAddr.zip || "";
+        if (!first_name || first_name === "Customer") first_name = defAddr.first_name || cust.first_name || first_name;
+        if (!last_name || last_name === "Customer") last_name = defAddr.last_name || cust.last_name || last_name;
+        console.log(`[Order Engine] Auto-populated missing address from Shopify customer profile ${shopifyCustomerId} (${defAddr.address1}, ${defAddr.city})`);
+      }
+    } catch (custErr) {
+      console.warn("[Order Engine] Could not fetch customer default address fallback:", custErr.message);
+    }
+  }
 
   const couponCode = customerData.couponCode || dbOrder?.couponCode || null;
   const couponDiscount = Number(customerData.couponDiscount || dbOrder?.couponDiscount || 0);
@@ -4327,17 +4426,6 @@ async function processAndCreateShopifyOrder({
   }, 0);
   const finalShipping = getShippingForCart(cart, cartSubtotal);
 
-  // Respect shipping actually charged to customer if provided (e.g. older app versions with legacy shipping rate)
-  const shippingCharged = (customerData.shippingAmount !== undefined && customerData.shippingAmount !== null)
-    ? Number(customerData.shippingAmount)
-    : (dbOrder?.shippingAmount !== undefined && dbOrder?.shippingAmount !== null
-        ? Number(dbOrder.shippingAmount)
-        : Number(finalShipping.price));
-
-  const effectiveShippingPrice = Number.isFinite(shippingCharged) ? shippingCharged.toFixed(2) : finalShipping.price;
-  const effectiveShippingTitle = Number(effectiveShippingPrice) === 0 ? "Free Shipping" : finalShipping.title;
-  const effectiveShippingCode = Number(effectiveShippingPrice) === 0 ? "FREE" : finalShipping.code;
-
   const bundleInfo = await computeAny3BundleDiscount(cart);
   const bundleDisc = Math.max(0, Number(bundleInfo?.discount || 0));
   const couponDisc = Math.max(0, Number(couponDiscount || 0));
@@ -4345,11 +4433,35 @@ async function processAndCreateShopifyOrder({
   const autoOffers = buildShopifyLineItemsWithPromotions(cart);
   const promoDisc = Math.max(0, Number(autoOffers.promotionalDiscount || 0));
 
+  const totalDiscounts = couponDisc + bundleDisc + promoDisc;
+  const subtotalAfterDiscounts = Math.max(0, cartSubtotal - totalDiscounts);
+
+  const paidAmount = Number(razorpayOrder?.amount_paid || razorpayOrder?.amount || customerData.amount || 0) / 100;
+
+  // Respect shipping actually charged to customer
+  let shippingCharged = null;
+  if (customerData.shippingAmount !== undefined && customerData.shippingAmount !== null && Number(customerData.shippingAmount) >= 0) {
+    shippingCharged = Number(customerData.shippingAmount);
+  } else if (dbOrder?.shippingAmount !== undefined && dbOrder?.shippingAmount !== null && Number(dbOrder.shippingAmount) > 0) {
+    shippingCharged = Number(dbOrder.shippingAmount);
+  } else if (paidAmount > subtotalAfterDiscounts) {
+    // If customer paid more than subtotal minus discounts, the excess is the shipping fee!
+    // This guarantees that if ₹99 shipping was collected, the order NEVER gets created with Free Shipping!
+    shippingCharged = Number((paidAmount - subtotalAfterDiscounts).toFixed(2));
+  } else if (dbOrder?.shippingAmount !== undefined && dbOrder?.shippingAmount !== null) {
+    shippingCharged = Number(dbOrder.shippingAmount);
+  } else {
+    shippingCharged = Number(finalShipping.price);
+  }
+
+  const effectiveShippingPrice = Number.isFinite(shippingCharged) ? shippingCharged.toFixed(2) : finalShipping.price;
+  const effectiveShippingTitle = Number(effectiveShippingPrice) === 0 ? "Free Shipping" : (finalShipping.title || "Standard Shipping");
+  const effectiveShippingCode = Number(effectiveShippingPrice) === 0 ? "FREE" : (finalShipping.code || "STANDARD");
+
   const calculatedOrderTotal = Math.max(
     0,
-    cartSubtotal + Number(effectiveShippingPrice) - couponDisc - bundleDisc - promoDisc
+    cartSubtotal + Number(effectiveShippingPrice) - totalDiscounts
   );
-  const paidAmount = Number(razorpayOrder?.amount_paid || razorpayOrder?.amount || customerData.amount || 0) / 100;
   const orderTotal = Number.isFinite(paidAmount) && paidAmount > 0
     ? paidAmount
     : calculatedOrderTotal;
@@ -4393,6 +4505,46 @@ async function processAndCreateShopifyOrder({
     );
 
     if (matchedShopifyOrder) {
+      if (!matchedShopifyOrder.shipping_address?.address1 && address1) {
+        try {
+          const updateAddr = {
+            first_name: first_name || "",
+            last_name: last_name || "",
+            address1,
+            address2,
+            city,
+            province,
+            country: country || "India",
+            zip: pincode,
+            phone: phone || "",
+          };
+          await axios.put(
+            `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders/${matchedShopifyOrder.id}.json`,
+            {
+              order: {
+                id: matchedShopifyOrder.id,
+                shipping_address: updateAddr,
+                billing_address: updateAddr,
+                ...(first_name ? {
+                  customer: {
+                    first_name,
+                    last_name: last_name || "",
+                  }
+                } : {})
+              },
+            },
+            {
+              headers: {
+                "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+              },
+            }
+          );
+          console.log(`[Order Engine] Updated missing shipping address on matched Shopify order ${matchedShopifyOrder.id}`);
+        } catch (updErr) {
+          console.error("[Order Engine] Failed to update address on matched order:", updErr.message);
+        }
+      }
+
       if (dbOrder) {
         dbOrder.status = "shopify_created";
         dbOrder.shopify_order_id = String(matchedShopifyOrder.id);
@@ -4410,10 +4562,6 @@ async function processAndCreateShopifyOrder({
   } catch (chkErr) {
     console.warn("[Order Engine] Shopify duplicate check note (proceeding):", chkErr.message);
   }
-
-  // 5. Lookup Customer ID by Email and Phone to prevent Duplicate Phone errors
-  const shopifyCustomerId = await getShopifyCustomerId(email, phone);
-  const normalizedPhone = normalizePhoneE164(phone, "IN");
 
   // 6. Build Order Payload
   const orderPayload = {
