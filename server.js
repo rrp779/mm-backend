@@ -4286,7 +4286,7 @@ async function processAndCreateShopifyOrder({
     throw new Error("Missing razorpay_order_id");
   }
 
-  // 0. Concurrency Mutex Lock: If this order is already being processed right now, wait for it!
+  // 0. SYNCHRONOUS In-Memory Lock Check BEFORE ANY AWAIT!
   if (activeOrderLocks.has(razorpay_order_id)) {
     console.log(`[Order Engine] Concurrent execution detected for ${razorpay_order_id}. Waiting for active Shopify order creation to complete...`);
     try {
@@ -4359,73 +4359,7 @@ async function processAndCreateShopifyOrder({
     }
   }
 
-  // 1. Fetch order from MongoDB
-  let dbOrder = await Order.findOne({ razorpay_order_id });
-
-  // If already created in Shopify, return existing order (Idempotent)
-  if (dbOrder && dbOrder.status === "shopify_created" && dbOrder.shopify_order_id) {
-    console.log(`[Order Engine] Order ${razorpay_order_id} already created in Shopify (ID: ${dbOrder.shopify_order_id})`);
-
-    // Backfill address if Shopify order or dbOrder was created without an address
-    const incomingAddress1 = customerData.address1 || customerData.shipping_address?.address1;
-    const existingHasAddress = !!(dbOrder.shipping_address?.address1 || dbOrder.shopify_order_data?.shipping_address?.address1);
-
-    if (incomingAddress1 && !existingHasAddress) {
-      try {
-        console.log(`[Order Engine] Existing Shopify order ${dbOrder.shopify_order_id} was missing shipping address. Backfilling now...`);
-        const updateAddr = {
-          first_name: customerData.first_name || dbOrder.first_name || "",
-          last_name: customerData.last_name || dbOrder.last_name || "",
-          address1: incomingAddress1,
-          address2: customerData.address2 || "",
-          city: customerData.city || "",
-          province: customerData.province || customerData.state || "",
-          country: customerData.country || "India",
-          zip: customerData.pincode || customerData.zip || "",
-          phone: customerData.phone || dbOrder.phone || "",
-        };
-        await axios.put(
-          `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders/${dbOrder.shopify_order_id}.json`,
-          {
-            order: {
-              id: Number(dbOrder.shopify_order_id),
-              shipping_address: updateAddr,
-              billing_address: updateAddr,
-              ...(customerData.first_name ? {
-                customer: {
-                  first_name: customerData.first_name,
-                  last_name: customerData.last_name || "",
-                }
-              } : {})
-            },
-          },
-          {
-            headers: {
-              "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
-            },
-          }
-        );
-        dbOrder.shipping_address = updateAddr;
-        dbOrder.billing_address = updateAddr;
-        if (customerData.first_name && (!dbOrder.first_name || dbOrder.first_name === "Customer")) {
-          dbOrder.first_name = customerData.first_name;
-          dbOrder.last_name = customerData.last_name || "";
-        }
-        await dbOrder.save();
-        console.log(`[Order Engine] Successfully backfilled address on existing Shopify order ${dbOrder.shopify_order_id}`);
-      } catch (updErr) {
-        console.error("[Order Engine] Failed to backfill address on existing order:", updErr.message);
-      }
-    }
-
-    return {
-      success: true,
-      order: dbOrder.shopify_order_data || { id: dbOrder.shopify_order_id, name: dbOrder.shopify_order_number },
-      message: "Order already created",
-    };
-  }
-
-  // Register active in-memory lock for this razorpay_order_id
+  // IMMEDIATELY acquire in-memory lock SYNCHRONOUSLY before ANY await!
   let lockResolve, lockReject;
   const lockPromise = new Promise((resolve, reject) => {
     lockResolve = resolve;
@@ -4434,10 +4368,134 @@ async function processAndCreateShopifyOrder({
   activeOrderLocks.set(razorpay_order_id, lockPromise);
 
   try {
-  // 2. Fetch Razorpay Order for verification & fallback
-  let razorpayOrder = null;
-  try {
-    razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
+    // 1. Fetch order from MongoDB
+    let dbOrder = await Order.findOne({ razorpay_order_id });
+
+    // If already created in Shopify, return existing order (Idempotent)
+    if (dbOrder && dbOrder.status === "shopify_created" && dbOrder.shopify_order_id) {
+      console.log(`[Order Engine] Order ${razorpay_order_id} already created in Shopify (ID: ${dbOrder.shopify_order_id})`);
+
+      // Backfill address if Shopify order or dbOrder was created without an address
+      const incomingAddress1 = customerData.address1 || customerData.shipping_address?.address1;
+      const existingHasAddress = !!(dbOrder.shipping_address?.address1 || dbOrder.shopify_order_data?.shipping_address?.address1);
+
+      if (incomingAddress1 && !existingHasAddress) {
+        try {
+          console.log(`[Order Engine] Existing Shopify order ${dbOrder.shopify_order_id} was missing shipping address. Backfilling now...`);
+          const updateAddr = {
+            first_name: customerData.first_name || dbOrder.first_name || "",
+            last_name: customerData.last_name || dbOrder.last_name || "",
+            address1: incomingAddress1,
+            address2: customerData.address2 || "",
+            city: customerData.city || "",
+            province: customerData.province || customerData.state || "",
+            country: customerData.country || "India",
+            zip: customerData.pincode || customerData.zip || "",
+            phone: customerData.phone || dbOrder.phone || "",
+          };
+          await axios.put(
+            `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders/${dbOrder.shopify_order_id}.json`,
+            {
+              order: {
+                id: Number(dbOrder.shopify_order_id),
+                shipping_address: updateAddr,
+                billing_address: updateAddr,
+                ...(customerData.first_name ? {
+                  customer: {
+                    first_name: customerData.first_name,
+                    last_name: customerData.last_name || "",
+                  }
+                } : {})
+              },
+            },
+            {
+              headers: {
+                "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+              },
+            }
+          );
+          dbOrder.shipping_address = updateAddr;
+          dbOrder.billing_address = updateAddr;
+          if (customerData.first_name && (!dbOrder.first_name || dbOrder.first_name === "Customer")) {
+            dbOrder.first_name = customerData.first_name;
+            dbOrder.last_name = customerData.last_name || "";
+          }
+          await dbOrder.save();
+          console.log(`[Order Engine] Successfully backfilled address on existing Shopify order ${dbOrder.shopify_order_id}`);
+        } catch (updErr) {
+          console.error("[Order Engine] Failed to backfill address on existing order:", updErr.message);
+        }
+      }
+
+      lockResolve(dbOrder.shopify_order_data || { id: dbOrder.shopify_order_id, name: dbOrder.shopify_order_number });
+      return {
+        success: true,
+        order: dbOrder.shopify_order_data || { id: dbOrder.shopify_order_id, name: dbOrder.shopify_order_number },
+        message: "Order already created",
+      };
+    }
+
+    // 1b. Distributed Atomic Mutex: Atomically claim creation rights across all cluster instances
+    if (dbOrder) {
+      const atomicClaim = await Order.findOneAndUpdate(
+        {
+          razorpay_order_id,
+          $and: [
+            {
+              $or: [
+                { shopify_order_id: { $exists: false } },
+                { shopify_order_id: null },
+                { shopify_order_id: "" }
+              ]
+            },
+            {
+              $or: [
+                { is_processing_shopify: { $ne: true } },
+                { processing_started_at: { $lt: new Date(Date.now() - 60000) } }
+              ]
+            }
+          ]
+        },
+        {
+          $set: {
+            is_processing_shopify: true,
+            processing_started_at: new Date()
+          }
+        },
+        { new: true }
+      );
+
+      if (!atomicClaim) {
+        console.log(`[Order Engine] Distributed lock already claimed by another worker for ${razorpay_order_id}. Polling for completion...`);
+        for (let attempt = 0; attempt < 20; attempt++) {
+          await new Promise(r => setTimeout(r, 1000));
+          const polled = await Order.findOne({ razorpay_order_id });
+          if (polled && polled.status === "shopify_created" && polled.shopify_order_id) {
+            if (lockResolve) lockResolve(polled.shopify_order_data || { id: polled.shopify_order_id, name: polled.shopify_order_number });
+            return {
+              success: true,
+              order: polled.shopify_order_data || { id: polled.shopify_order_id, name: polled.shopify_order_number },
+              message: "Order already created (distributed lock resolved)",
+            };
+          }
+        }
+        const finalPolled = await Order.findOne({ razorpay_order_id });
+        if (finalPolled && finalPolled.status === "shopify_created" && finalPolled.shopify_order_id) {
+          if (lockResolve) lockResolve(finalPolled.shopify_order_data || { id: finalPolled.shopify_order_id, name: finalPolled.shopify_order_number });
+          return {
+            success: true,
+            order: finalPolled.shopify_order_data || { id: finalPolled.shopify_order_id, name: finalPolled.shopify_order_number },
+            message: "Order already created (distributed lock resolved)",
+          };
+        }
+        throw new Error(`Order creation is already being processed by another worker for ${razorpay_order_id}`);
+      }
+    }
+
+    // 2. Fetch Razorpay Order for verification & fallback
+    let razorpayOrder = null;
+    try {
+      razorpayOrder = await razorpay.orders.fetch(razorpay_order_id);
   } catch (rErr) {
     console.error("[Order Engine] Failed to fetch Razorpay order:", rErr.message);
   }
@@ -4804,6 +4862,7 @@ async function processAndCreateShopifyOrder({
   try {
     if (dbOrder) {
       dbOrder.status = "shopify_created";
+      dbOrder.is_processing_shopify = false;
       dbOrder.razorpay_payment_id = razorpay_payment_id || dbOrder.razorpay_payment_id;
       dbOrder.razorpay_signature = razorpay_signature || dbOrder.razorpay_signature;
       dbOrder.shopify_order_id = String(createdOrder.id);
@@ -4817,6 +4876,7 @@ async function processAndCreateShopifyOrder({
         razorpay_payment_id,
         razorpay_signature,
         status: "shopify_created",
+        is_processing_shopify: false,
         amount: orderTotal,
         cart,
         email,
@@ -4859,6 +4919,12 @@ async function processAndCreateShopifyOrder({
       order: createdOrder,
     };
   } catch (creationErr) {
+    try {
+      await Order.updateOne(
+        { razorpay_order_id },
+        { $set: { is_processing_shopify: false } }
+      );
+    } catch (_) {}
     if (lockReject) lockReject(creationErr);
     throw creationErr;
   } finally {
@@ -4969,7 +5035,7 @@ app.post("/api/payment/verify", async (req, res) => {
 
       try {
         await Order.updateOne(
-          { razorpay_order_id: req.body.razorpay_order_id },
+          { razorpay_order_id: req.body.razorpay_order_id, status: { $ne: "shopify_created" } },
           {
             status: "failed",
             error_log: JSON.stringify(shopifyData || info.message),
@@ -5059,7 +5125,18 @@ app.post("/api/payment/webhook", async (req, res) => {
       const razorpay_payment_id = paymentEntity?.id;
 
       if (razorpay_order_id) {
-        console.log(`[Webhook] Processing order for ${razorpay_order_id} (Payment: ${razorpay_payment_id})`);
+        // Quick deduplication check: if order already created in Shopify, skip processing
+        try {
+          const existingOrder = await Order.findOne({ razorpay_order_id }).select("status shopify_order_id").lean();
+          if (existingOrder && existingOrder.status === "shopify_created" && existingOrder.shopify_order_id) {
+            console.log(`[Webhook] Order ${razorpay_order_id} already created in Shopify (ID: ${existingOrder.shopify_order_id}). Skipping redundant webhook processing.`);
+            return res.status(200).json({ status: "ok", message: "Order already created" });
+          }
+        } catch (findErr) {
+          console.warn("[Webhook] Error checking existing order:", findErr.message);
+        }
+
+        console.log(`[Webhook] Processing order for ${razorpay_order_id} (Payment: ${razorpay_payment_id}, Event: ${event})`);
         processAndCreateShopifyOrder({
           razorpay_order_id,
           razorpay_payment_id,
