@@ -4273,6 +4273,9 @@ async function markShopifyOrderAsPaid(numericOrderId) {
   return false;
 }
 
+// Concurrency Mutex Lock: prevents race condition when webhook and verify fire simultaneously
+const activeOrderLocks = new Map();
+
 async function processAndCreateShopifyOrder({
   razorpay_order_id,
   razorpay_payment_id,
@@ -4281,6 +4284,79 @@ async function processAndCreateShopifyOrder({
 }) {
   if (!razorpay_order_id) {
     throw new Error("Missing razorpay_order_id");
+  }
+
+  // 0. Concurrency Mutex Lock: If this order is already being processed right now, wait for it!
+  if (activeOrderLocks.has(razorpay_order_id)) {
+    console.log(`[Order Engine] Concurrent execution detected for ${razorpay_order_id}. Waiting for active Shopify order creation to complete...`);
+    try {
+      await activeOrderLocks.get(razorpay_order_id);
+    } catch (waitErr) {
+      console.warn(`[Order Engine] Active order creation promise rejected:`, waitErr.message);
+    }
+
+    // After active creation finishes, check MongoDB and return the created order
+    let existingDbOrder = await Order.findOne({ razorpay_order_id });
+    if (existingDbOrder && existingDbOrder.status === "shopify_created" && existingDbOrder.shopify_order_id) {
+      console.log(`[Order Engine] Concurrent lock resolved: returning existing order ${existingDbOrder.shopify_order_id}`);
+
+      // Backfill address if Shopify order was created without an address
+      const incomingAddress1 = customerData.address1 || customerData.shipping_address?.address1;
+      const existingHasAddress = !!(existingDbOrder.shipping_address?.address1 || existingDbOrder.shopify_order_data?.shipping_address?.address1);
+
+      if (incomingAddress1 && !existingHasAddress) {
+        try {
+          const updateAddr = {
+            first_name: customerData.first_name || existingDbOrder.first_name || "",
+            last_name: customerData.last_name || existingDbOrder.last_name || "",
+            address1: incomingAddress1,
+            address2: customerData.address2 || "",
+            city: customerData.city || "",
+            province: customerData.province || customerData.state || "",
+            country: customerData.country || "India",
+            zip: customerData.pincode || customerData.zip || "",
+            phone: customerData.phone || existingDbOrder.phone || "",
+          };
+          await axios.put(
+            `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/orders/${existingDbOrder.shopify_order_id}.json`,
+            {
+              order: {
+                id: Number(existingDbOrder.shopify_order_id),
+                shipping_address: updateAddr,
+                billing_address: updateAddr,
+                ...(customerData.first_name ? {
+                  customer: {
+                    first_name: customerData.first_name,
+                    last_name: customerData.last_name || "",
+                  }
+                } : {})
+              },
+            },
+            {
+              headers: {
+                "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+              },
+            }
+          );
+          existingDbOrder.shipping_address = updateAddr;
+          existingDbOrder.billing_address = updateAddr;
+          if (customerData.first_name && (!existingDbOrder.first_name || existingDbOrder.first_name === "Customer")) {
+            existingDbOrder.first_name = customerData.first_name;
+            existingDbOrder.last_name = customerData.last_name || "";
+          }
+          await existingDbOrder.save();
+          console.log(`[Order Engine] Successfully backfilled address after concurrent lock for order ${existingDbOrder.shopify_order_id}`);
+        } catch (updErr) {
+          console.error("[Order Engine] Failed to backfill address after concurrent lock:", updErr.message);
+        }
+      }
+
+      return {
+        success: true,
+        order: existingDbOrder.shopify_order_data || { id: existingDbOrder.shopify_order_id, name: existingDbOrder.shopify_order_number },
+        message: "Order already created (concurrent lock)",
+      };
+    }
   }
 
   // 1. Fetch order from MongoDB
@@ -4349,6 +4425,15 @@ async function processAndCreateShopifyOrder({
     };
   }
 
+  // Register active in-memory lock for this razorpay_order_id
+  let lockResolve, lockReject;
+  const lockPromise = new Promise((resolve, reject) => {
+    lockResolve = resolve;
+    lockReject = reject;
+  });
+  activeOrderLocks.set(razorpay_order_id, lockPromise);
+
+  try {
   // 2. Fetch Razorpay Order for verification & fallback
   let razorpayOrder = null;
   try {
@@ -4500,8 +4585,8 @@ async function processAndCreateShopifyOrder({
       }
     );
     const matchedShopifyOrder = existingOrder.data.orders.find(o =>
-      (razorpay_payment_id && o.note?.includes(razorpay_payment_id)) ||
-      (razorpay_order_id && o.note?.includes(razorpay_order_id))
+      (razorpay_payment_id && (o.note?.includes(razorpay_payment_id) || o.note_attributes?.some(a => a.value === razorpay_payment_id))) ||
+      (razorpay_order_id && (o.note?.includes(razorpay_order_id) || o.note_attributes?.some(a => a.value === razorpay_order_id)))
     );
 
     if (matchedShopifyOrder) {
@@ -4553,6 +4638,7 @@ async function processAndCreateShopifyOrder({
         dbOrder.updated_at = new Date();
         await dbOrder.save();
       }
+      if (lockResolve) lockResolve(matchedShopifyOrder);
       return {
         success: true,
         order: matchedShopifyOrder,
@@ -4767,10 +4853,19 @@ async function processAndCreateShopifyOrder({
     console.error("[Order Engine] Notification trigger error:", notifErr.message)
   );
 
-  return {
-    success: true,
-    order: createdOrder,
-  };
+    if (lockResolve) lockResolve(createdOrder);
+    return {
+      success: true,
+      order: createdOrder,
+    };
+  } catch (creationErr) {
+    if (lockReject) lockReject(creationErr);
+    throw creationErr;
+  } finally {
+    setTimeout(() => {
+      activeOrderLocks.delete(razorpay_order_id);
+    }, 60000);
+  }
 }
 
 /* ------------------ VERIFY PAYMENT ------------------ */
