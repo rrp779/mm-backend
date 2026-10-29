@@ -450,7 +450,32 @@ const KAJAL_VARIANT_IDS = new Set([
   "67745185628464", "67745185661232", "67745185694000", "67745185726768", "67745185759536"
 ]);
 
-function buildShopifyLineItemsWithPromotions(cart) {
+function sanitizeIncomingCart(cart) {
+  if (!Array.isArray(cart)) return [];
+  return cart.filter(item => {
+    const price = Number(item.price ?? item.unitPrice ?? 0);
+    const handle = String(item.handle || "").toLowerCase();
+    const title = String(item.title || "").toLowerCase();
+    const variantId = String(toNumericId(item.variant_id || item.variantId) || "");
+
+    // Known clone/bogos gift variant or handle
+    if (variantId === "68045778157872" || handle.includes("sca_clone") || handle.includes("freegift") || handle.includes("bogos") || title.includes("🎁")) {
+      console.warn(`[Security/Cart Sanitizer] Blocked rogue clone/gift item: ${title || handle || variantId}`);
+      return false;
+    }
+
+    // Zero-price item sent directly by client (free gifts may only be added by backend promotions engine)
+    if (price <= 0) {
+      console.warn(`[Security/Cart Sanitizer] Blocked zero-price item sent by client: ${title || handle || variantId}`);
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function buildShopifyLineItemsWithPromotions(rawCart) {
+  const cart = sanitizeIncomingCart(rawCart);
   if (!Array.isArray(cart) || cart.length === 0) {
     return { line_items: [], promotionalDiscount: 0, appliedPromotions: [] };
   }
@@ -588,11 +613,15 @@ function buildShopifyLineItemsWithPromotions(cart) {
         discount: it.unitPrice || 422.50
       });
     } else {
-      finalLineItems.push({
-        variant_id: it.numericVariantId,
-        quantity: it.qty,
-        price: it.unitPrice > 0 ? it.unitPrice.toFixed(2) : undefined
-      });
+      if (it.unitPrice > 0) {
+        finalLineItems.push({
+          variant_id: it.numericVariantId,
+          quantity: it.qty,
+          price: it.unitPrice.toFixed(2)
+        });
+      } else {
+        console.warn(`[Order Engine] Skipped non-promotional item with zero price: ${it.numericVariantId}`);
+      }
     }
   }
 
@@ -4157,8 +4186,11 @@ app.post("/api/payment/create-order", async (req, res) => {
       return res.status(500).json({ error: "Payment config missing" });
     }
 
+    // Sanitize incoming cart from client
+    const sanitizedCart = sanitizeIncomingCart(cart);
+
     // Evaluate automatic promotions on cart
-    const autoOffers = buildShopifyLineItemsWithPromotions(cart);
+    const autoOffers = buildShopifyLineItemsWithPromotions(sanitizedCart);
     const calculatedPromoDisc = Math.max(0, Number(autoOffers.promotionalDiscount || 0));
     const effectivePromoDisc = Number.isFinite(Number(rawPromoDisc)) && Number(rawPromoDisc) > 0
       ? Number(rawPromoDisc)
@@ -4177,7 +4209,7 @@ app.post("/api/payment/create-order", async (req, res) => {
         email: cleanEmail.slice(0, 100),
         phone: cleanPhone.slice(0, 30),
         receipt: receiptId,
-        itemsCount: Array.isArray(cart) ? String(cart.length) : "0",
+        itemsCount: Array.isArray(sanitizedCart) ? String(sanitizedCart.length) : "0",
       },
     };
 
@@ -4192,7 +4224,7 @@ app.post("/api/payment/create-order", async (req, res) => {
         razorpay_order_id: order.id,
         status: "created",
         amount: Number(amount || 0) / 100,
-        cart: Array.isArray(cart) ? cart : [],
+        cart: sanitizedCart,
         email: cleanEmail,
         phone: cleanPhone,
         first_name: String(first_name || "").trim(),
@@ -4512,6 +4544,8 @@ async function processAndCreateShopifyOrder({
       console.error("[Order Engine] Error parsing cart from notes:", parseErr.message);
     }
   }
+
+  cart = sanitizeIncomingCart(cart);
 
   // Merge customer and address info
   let first_name = customerData.first_name || dbOrder?.first_name || "";
