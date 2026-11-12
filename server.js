@@ -969,15 +969,43 @@ async function getOrCreateOtpCustomerToken({ phone, firstName, lastName }) {
   try {
     return await loginOtpCustomer(phone);
   } catch (_) {
-    // Check if the phone is registered to an existing customer account!
+    // Check if the phone is registered to an existing customer account in Shopify
     const existingCustomer = await getShopifyCustomerByPhone(phone);
     if (existingCustomer) {
-      if (!existingCustomer.email) {
-        throw new Error("Shopify has redacted the email for this customer. Please go to your Shopify Admin -> Develop Apps -> Select your app -> API Integration, and request/enable access to 'Protected Customer Data' so the app can link WhatsApp logins to email accounts.");
-      }
       const password = makeOtpCustomerPassword(phone);
-      await updateShopifyCustomerPassword(existingCustomer.id, password);
-      return await loginOtpCustomerWithRealEmail(existingCustomer.email, phone);
+      const targetEmail = existingCustomer.email || makeOtpCustomerEmail(phone);
+      const cleanId = String(existingCustomer.id || "").replace(/^gid:\/\/shopify\/Customer\//, "");
+
+      const updatePayload = {
+        id: cleanId,
+        password: password,
+        password_confirmation: password,
+      };
+      if (!existingCustomer.email) {
+        updatePayload.email = targetEmail;
+      }
+      if (firstName && (!existingCustomer.first_name || existingCustomer.first_name === "Customer")) {
+        updatePayload.first_name = firstName;
+      }
+      if (lastName && (!existingCustomer.last_name || existingCustomer.last_name === "Customer")) {
+        updatePayload.last_name = lastName;
+      }
+
+      try {
+        await axios.put(
+          `https://${process.env.SHOPIFY_STORE}/admin/api/2024-04/customers/${cleanId}.json`,
+          { customer: updatePayload },
+          {
+            headers: {
+              "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+            },
+          }
+        );
+      } catch (updErr) {
+        console.error("Failed to update existing customer credentials in Shopify:", updErr.response?.data || updErr.message);
+      }
+
+      return await loginOtpCustomerWithRealEmail(targetEmail, phone);
     }
 
     await createOtpCustomer({ phone, firstName, lastName });
